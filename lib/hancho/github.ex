@@ -17,12 +17,36 @@ defmodule Hancho.GitHub do
           url
           state
           body
+          updatedAt
           parent { id }
           subIssues { totalCount }
           comments(first: 100) {
             pageInfo { hasNextPage }
             nodes { body }
           }
+        }
+      }
+    }
+  }
+  """
+
+  @node_query """
+  query($id: ID!) {
+    node(id: $id) {
+      ... on Issue {
+        id
+        number
+        title
+        url
+        state
+        body
+        updatedAt
+        repository { nameWithOwner }
+        parent { id }
+        subIssues { totalCount }
+        comments(first: 100) {
+          pageInfo { hasNextPage }
+          nodes { body }
         }
       }
     }
@@ -67,6 +91,27 @@ defmodule Hancho.GitHub do
     end
   end
 
+  @spec fetch(String.t(), keyword()) :: {:ok, Issue.t()} | {:error, term()}
+  def fetch(node_id, options \\ []) do
+    with {:ok, %{"nameWithOwner" => expected_repository}} <-
+           run_json(["repo", "view", "--json", "nameWithOwner"], options),
+         {:ok, response} <-
+           run_json(
+             ["api", "graphql", "-f", "query=#{@node_query}", "-F", "id=#{node_id}"],
+             options
+           ),
+         {:ok, value} <- extract_node_value(response),
+         repository when is_binary(repository) <- get_in(value, ["repository", "nameWithOwner"]),
+         :ok <- same_repository(repository, expected_repository),
+         {:ok, [issue]} <- parse_issues(repository, [value]) do
+      {:ok, issue}
+    else
+      nil -> {:error, :github_issue_not_found}
+      {:error, reason} -> {:error, reason}
+      value -> {:error, {:invalid_github_result, value}}
+    end
+  end
+
   @spec comment(Issue.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def comment(%Issue{} = issue, body, options \\ []) do
     run_json(
@@ -102,6 +147,19 @@ defmodule Hancho.GitHub do
   defp extract_issue_values(%{"errors" => errors}), do: {:error, {:github_graphql, errors}}
   defp extract_issue_values(value), do: {:error, {:invalid_github_issues, value}}
 
+  defp extract_node_value(%{"data" => %{"node" => nil}}), do: {:error, :github_issue_not_found}
+
+  defp extract_node_value(%{"data" => %{"node" => value}}) when is_map(value) do
+    if get_in(value, ["comments", "pageInfo", "hasNextPage"]) do
+      {:error, :github_comment_limit_exceeded}
+    else
+      {:ok, value}
+    end
+  end
+
+  defp extract_node_value(%{"errors" => errors}), do: {:error, {:github_graphql, errors}}
+  defp extract_node_value(value), do: {:error, {:invalid_github_issue, value}}
+
   defp parse_issues(repository, values) do
     Enum.reduce_while(values, {:ok, []}, fn value, {:ok, issues} ->
       attributes = %{
@@ -112,6 +170,7 @@ defmodule Hancho.GitHub do
         url: value["url"],
         state: String.downcase(value["state"] || ""),
         body: value["body"],
+        updated_at: value["updatedAt"],
         parent_node_id: get_in(value, ["parent", "id"]),
         comments: Enum.map(get_in(value, ["comments", "nodes"]) || [], &(&1["body"] || "")),
         child_count: get_in(value, ["subIssues", "totalCount"]) || 0
@@ -127,6 +186,11 @@ defmodule Hancho.GitHub do
       error -> error
     end
   end
+
+  defp same_repository(repository, repository), do: :ok
+
+  defp same_repository(actual, expected),
+    do: {:error, {:github_repository_mismatch, expected, actual}}
 
   defp run_json(arguments, options) do
     with {:ok, output} <- run(arguments, options),

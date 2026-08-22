@@ -116,11 +116,13 @@ defmodule Hancho.Workflow.QueueRunner do
   defp workflow_settings(definition) do
     implement = Enum.find(definition.steps, &(&1.action == "Hancho.Actions.Implement"))
     verify = Enum.find(definition.steps, &(&1.action == "Hancho.Actions.Verify"))
+    implement_params = resolved_params(definition, implement)
 
     %{
-      provider: step_param(implement, "provider"),
-      reasoning_effort: step_param(implement, "reasoning_effort"),
-      implementation_timeout_ms: step_param(implement, "timeout_ms"),
+      provider: param(implement_params, "provider"),
+      model: param(implement_params, "model"),
+      reasoning_effort: param(implement_params, "reasoning_effort"),
+      implementation_timeout_ms: param(implement_params, "timeout_ms"),
       verification_timeout_ms: step_param(verify, "timeout_ms"),
       repairs:
         definition.steps
@@ -138,6 +140,15 @@ defmodule Hancho.Workflow.QueueRunner do
 
   defp step_param(nil, _name), do: nil
   defp step_param(step, name), do: Map.get(step.params, name)
+
+  defp resolved_params(_definition, nil), do: %{}
+
+  defp resolved_params(definition, step),
+    do: Hancho.Workflow.RoleResolver.params(definition, step)
+
+  defp param(params, name) do
+    Enum.find_value(params, fn {key, value} -> if to_string(key) == name, do: value end)
+  end
 
   defp run_with_store(
          project,
@@ -266,17 +277,24 @@ defmodule Hancho.Workflow.QueueRunner do
 
     with :ok <- store_api.complete_queue(store, queue_id),
          :ok <- store_api.flush(store),
+         {:ok, result} <- QueueReporter.result(store_api, store, queue_id, workflow),
          :ok <-
            QueueReporter.emit(
              project,
              queue_id,
              "queue.completed",
              "Queue #{queue_id} completed #{length(items)}/#{length(items)} tasks.",
-             %{completed_count: length(items), total_count: length(items)},
+             %{
+               completed_count: length(items),
+               total_count: length(items),
+               elapsed_ms: result.elapsed_ms,
+               task_summaries: result.task_summaries,
+               usage_summary: result.usage_summary
+             },
              true,
              options
            ) do
-      QueueReporter.result(store_api, store, queue_id, workflow)
+      {:ok, result}
     end
   end
 

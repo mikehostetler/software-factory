@@ -45,7 +45,19 @@ defmodule Hancho.Workflow.Inspector do
         nil
 
       result ->
-        Map.take(result, ["provider", "harness_run_id", "status", "text", "text_truncated"])
+        Map.take(result, [
+          "provider",
+          "model",
+          "model_source",
+          "harness_run_id",
+          "status",
+          "provider_elapsed_ms",
+          "provider_elapsed_scope",
+          "usage",
+          "credential_protection",
+          "text",
+          "text_truncated"
+        ])
     end
   end
 

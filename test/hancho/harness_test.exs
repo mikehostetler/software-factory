@@ -265,6 +265,52 @@ defmodule Hancho.HarnessTest do
     assert :ok = Jido.Harness.Run.prune(result.run_id)
   end
 
+  test "warns when provider activity has no productive progress" do
+    providers = Application.get_env(:jido_harness, :providers)
+    :ok = Hancho.Harness.ensure_started()
+
+    Application.put_env(
+      :jido_harness,
+      :providers,
+      Map.put(Map.new(providers || %{}), :codex, PulsedAdapter)
+    )
+
+    on_exit(fn -> restore_env(:providers, providers) end)
+    test_pid = self()
+
+    assert {:ok, result} =
+             Hancho.Harness.run_with_progress(
+               :codex,
+               "Warn while thought events continue.",
+               [
+                 cwd: temporary_directory(),
+                 await_timeout: 1_000,
+                 runtime_timeout_ms: 1_000,
+                 idle_timeout_ms: 1_000,
+                 progress_interval_ms: 5,
+                 andon_warning_ms: 200,
+                 productive_warning_ms: 10
+               ],
+               fn progress ->
+                 send(test_pid, {:productive_progress, progress})
+                 :ok
+               end
+             )
+
+    assert result.status == :completed
+
+    assert_received {:productive_progress,
+                     %{
+                       phase: :productivity_andon,
+                       productive_warning_ms: 10,
+                       productive_event_count: 0,
+                       last_productive_event: nil
+                     }}
+
+    refute_received {:productive_progress, %{phase: :andon}}
+    assert :ok = Jido.Harness.Run.prune(result.run_id)
+  end
+
   defp temporary_directory do
     path = Path.join(System.tmp_dir!(), "hancho-harness-#{System.unique_integer([:positive])}")
     File.mkdir_p!(path)

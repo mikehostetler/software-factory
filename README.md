@@ -86,12 +86,14 @@ This command stays in the foreground. `--verbose` also streams safe summaries
 of normalized provider events while the coding agent works. The workflow does
 these steps in order:
 
-1. Check the Git repository and Beadwork task.
+1. Check the Git repository and Beadwork task. For a mapped task, load and
+   validate the authoritative GitHub demand.
 2. Claim the task.
 3. Create a detached worktree in `.hancho/worktrees/`.
 4. Render and save the agent prompt.
 5. Call the configured CLI coding agent through Jido.Harness.
-6. Check changed paths against the Beadwork `Allowed Scope`, when configured.
+6. Check changed paths against the authoritative demand `Allowed Scope`, when
+   configured.
 7. Run `mix test`.
 8. Create a conventional Git commit.
 9. Fast-forward the original branch to the commit.
@@ -147,6 +149,24 @@ snapshot. A retry therefore does not read a changed prompt file. The selected
 provider must support the requested model, reasoning effort, and extra
 arguments. `xhigh` currently uses the Grok adapter because the normalized
 Harness reasoning enum stops at `high`.
+
+Set `model` to pin a provider model. Hancho sends that exact configured value
+to Harness and records it in dry-run output, provider progress, and the durable
+implementation result. When `model` is absent, Hancho reports `provider default;
+not pinned`. It does not claim that the provider's changing default is pinned.
+Jido.Harness does not report the effective model for all providers, so Hancho
+can always prove the requested model but cannot always prove provider fallback
+behavior.
+
+Hancho requests the Harness `workspace_write` sandbox for implementation. It
+also sends path deny rules for common credential stores to Grok, Claude, and
+Z.AI. The rules cover GitHub CLI hosts files, SSH private keys, cloud credential
+files, `.env` files, and similar stores. The pinned Jido.Harness adapters for
+Codex, Gemini, Amp, Kimi, OpenCode, and Pi do not expose a reliable file-read
+deny control. For those adapters, Hancho records `workspace_sandbox_only` as a
+limitation. Harness sandbox modes are provider requests, not a universal
+operating-system read sandbox. Do not make host credential stores available in
+an implementation workspace.
 
 When two adjacent steps have different roles, Hancho writes a durable handoff
 record before the first step completes. The record names the run, roles, steps,
@@ -374,6 +394,15 @@ Issue and supports one sub-issue level. It stops instead of returning an
 incomplete view when either limit is exceeded. The commands require authenticated
 `gh` and initialized `bw` clients for the current repository.
 
+Before a mapped workflow can claim work or call a coding provider, Hancho loads
+the selected GitHub sub-issue by node ID. It proves the repository, URL, node
+ID, GitHub backlink, and mapped parent. A missing, closed, or mismatched demand
+stops the workflow. Hancho stores the repository identity, URL, node ID, title,
+full body, update time, and a content SHA-256 in the durable preflight result.
+The prompt and scope gate use this same snapshot. Resume reuses it and does not
+replace it with the copied Beadwork description. GitHub remains the source of
+truth; `.hancho/demand-mappings.json` is never a demand-body fallback.
+
 ## Foreground queues
 
 Run an explicit number of ready Beadwork tasks through one workflow:
@@ -390,7 +419,8 @@ without writing state, claiming work, creating a worktree, or calling an agent:
 ```
 
 The preview reports the branch, commit, clean status, retained worktree count,
-provider, and implementation and verification timeouts. It also compiles the
+provider, configured model or unpinned state, and implementation and
+verification timeouts. It also compiles the
 workflow and checks action modules, parameters, references, prompt files,
 provider readiness, and required executables. A repository, worktree, or
 workflow error stops the preview before a live run can start.
@@ -417,6 +447,10 @@ terminal queue result. During implementation it also prints normalized provider
 text, thought, tool, file, plan, usage, approval, and terminal updates. Tool
 results are summarized; Hancho does not print their full payloads to the
 console. Normal mode keeps the short periodic implementation progress lines.
+The terminal summary reports durable queue elapsed time, each task's elapsed
+time, configured model, and provider usage. Hancho adds only usage that the
+adapter identifies as run-scoped. It labels Grok values as provider-cumulative
+and does not add them. Missing and unknown-scope values remain explicit.
 Hancho also saves queue events in the factory log:
 
 - `queue.started`
@@ -475,6 +509,7 @@ Read one durable run without starting or changing it:
 The report shows the workflow status, start and finish times, step durations,
 provider and Harness run IDs, verification summary, landed or created commit,
 retained worktree, failure data, and the forensic report path when one exists.
+It also shows the configured model and normalized provider usage when available.
 
 When a workflow stops, Hancho writes a private JSON report to
 `.hancho/forensics/runs/RUN_ID.json`. When a queue stops, Hancho writes a second
@@ -499,6 +534,14 @@ does not stop the run. Set `andon_warning_ms` on the implementation step to
 change the threshold. Repair calls use `repair.andon` and the threshold in the
 gate's `on_error` policy. The separate `idle_timeout_ms` remains the stop limit.
 
+Hancho keeps a second warning-only clock for productive progress. Provider
+thought and text events count as activity, but they do not reset this clock.
+A normalized file change or a completed test/build result resets it. After
+`productive_warning_ms` (two minutes by default), Hancho writes
+`implement.productivity_andon` or `repair.productivity_andon`. The warning does
+not cancel the provider. This makes long active runs with no bounded result
+visible without adding an unsafe automatic retry.
+
 Verification writes complete merged standard output to a protected file in
 `.hancho/logs/`. Factory activity contains one `verify.progress` event per 64
 KiB and one `verify.completed` summary. It does not write one factory event for
@@ -511,14 +554,11 @@ log remains available at the protected output path.
 
 ## Retained worktrees
 
-Hancho keeps source isolation but shares safe Mix build inputs between serial
-worktrees. Agent and verification processes receive repository-local
-`MIX_DEPS_PATH` and `MIX_BUILD_PATH` values under `.hancho/cache/mix/`. The cache
-key contains `mix.exs`, `mix.lock`, the Elixir version, and the OTP release. A
-dependency, project, or runtime change selects a new cache. This removes most
-dependency download and compile work after the first run. Parallel workflow
-execution remains disabled, so two Hancho workers do not write the same build
-cache at the same time.
+Hancho keeps each task isolated. The coding provider and verification command
+use `deps` and `_build` in that task's worktree. Hancho creates these directories
+and proves that they are writable before it starts the process. It rejects a
+symbolic link at either path. A setup failure stops the action before provider
+execution. Hancho does not share or copy Mix build data between worktrees.
 
 List retained worktrees and their total storage use:
 
@@ -533,8 +573,7 @@ run:
 ./hancho worktrees inspect RUN_ID
 ```
 
-Remove only `_build`, `deps`, and `cover` from one registered retained
-worktree:
+Remove `_build`, `deps`, and `cover` from one registered retained worktree:
 
 ```sh
 ./hancho worktrees clean RUN_ID

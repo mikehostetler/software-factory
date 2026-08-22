@@ -8,6 +8,7 @@ defmodule Hancho.Actions.Implement do
       Zoi.object(%{
         prompt: Zoi.string() |> Zoi.min(1),
         worktree_path: Zoi.string() |> Zoi.min(1),
+        repo_path: Zoi.string() |> Zoi.min(1) |> Zoi.optional(),
         provider: Zoi.string() |> Zoi.min(1),
         cli: Zoi.string() |> Zoi.min(1) |> Zoi.optional(),
         model: Zoi.string() |> Zoi.min(1) |> Zoi.optional(),
@@ -16,6 +17,7 @@ defmodule Hancho.Actions.Implement do
         timeout_ms: Zoi.integer() |> Zoi.min(1),
         idle_timeout_ms: Zoi.integer() |> Zoi.min(1) |> Zoi.default(300_000),
         andon_warning_ms: Zoi.integer() |> Zoi.min(1) |> Zoi.default(120_000),
+        productive_warning_ms: Zoi.integer() |> Zoi.min(1) |> Zoi.default(120_000),
         progress_interval_ms: Zoi.integer() |> Zoi.min(1) |> Zoi.default(30_000)
       })
 
@@ -37,20 +39,44 @@ defmodule Hancho.Actions.Implement do
   @impl true
   def run(params, context) do
     harness = Context.service(context, :harness, Hancho.Harness)
+    worktree_setup = Context.service(context, :worktree_setup, Hancho.WorktreeSetup)
+    repository = Map.get(params, :repo_path) || repository_from_worktree(params.worktree_path)
 
     with {:ok, provider} <- fetch_provider(params.provider),
          :ok <- validate_reasoning(provider, Map.get(params, :reasoning_effort)),
+         {:ok, mix_paths} <- worktree_setup.prepare(params.worktree_path),
          {:ok, prior_run} <- prior_harness_run(context),
-         {:ok, result} <- run_harness(harness, provider, params, prior_run, context),
-         :ok <- completed(result) do
+         security = Hancho.ProviderSecurity.options(provider),
+         :ok <- audit_configuration(context, params, mix_paths, security),
+         provider_started_at = System.monotonic_time(:millisecond),
+         {:ok, result} <-
+           run_harness(
+             harness,
+             provider,
+             params,
+             repository,
+             mix_paths,
+             security,
+             prior_run,
+             context
+           ),
+         :ok <- completed(result),
+         provider_elapsed_ms = System.monotonic_time(:millisecond) - provider_started_at do
       {:ok,
        %{
          provider: params.provider,
          model: Map.get(params, :model),
+         model_source: model_source(params),
          harness_run_id: result.run_id,
          status: result.status,
+         provider_elapsed_ms: provider_elapsed_ms,
+         provider_elapsed_scope: "hancho_wait",
+         usage:
+           Hancho.ProviderUsage.normalize(provider, result.usage) |> Hancho.ProviderUsage.to_map(),
          text: tail(result.text, 20_000),
-         text_truncated: result.text_truncated? or byte_size(result.text) > 20_000
+         text_truncated: result.text_truncated? or byte_size(result.text) > 20_000,
+         mix_paths: Map.drop(mix_paths, [:env]),
+         credential_protection: security.evidence
        }}
     end
   end
@@ -58,21 +84,33 @@ defmodule Hancho.Actions.Implement do
   @spec provider(String.t()) :: {:ok, atom()} | {:error, String.t()}
   def provider(name), do: fetch_provider(name)
 
-  defp run_harness(harness, provider, params, prior_run, context) do
-    repository = repository_from_worktree(params.worktree_path)
+  defp run_harness(
+         harness,
+         provider,
+         params,
+         repository,
+         mix_paths,
+         security,
+         prior_run,
+         context
+       ) do
     reasoning_options = reasoning_options(provider, Map.get(params, :reasoning_effort))
-    provider_options = provider_options(params, reasoning_options)
+
+    provider_options =
+      security.provider_options
+      |> Map.merge(provider_options(params, reasoning_options))
 
     options =
       [
         cwd: params.worktree_path,
         model: Map.get(params, :model),
-        env: Hancho.WorktreeCache.environment(params.worktree_path),
+        env: mix_paths.env,
         approval_mode: approval_mode(provider),
         sandbox_mode: :workspace_write,
         runtime_timeout_ms: params.timeout_ms,
         idle_timeout_ms: min(params.idle_timeout_ms, params.timeout_ms),
         andon_warning_ms: params.andon_warning_ms,
+        productive_warning_ms: Map.get(params, :productive_warning_ms, 120_000),
         await_timeout: params.timeout_ms + 60_000,
         cancellation_timeout_ms: 30_000,
         progress_interval_ms: params.progress_interval_ms,
@@ -85,7 +123,12 @@ defmodule Hancho.Actions.Implement do
       |> verbose_event_options(context)
 
     if Code.ensure_loaded?(harness) and function_exported?(harness, :run_with_progress, 4) do
-      harness.run_with_progress(provider, params.prompt, options, progress_callback(context))
+      harness.run_with_progress(
+        provider,
+        params.prompt,
+        options,
+        progress_callback(context, params)
+      )
     else
       harness.run(provider, params.prompt, Keyword.delete(options, :progress_interval_ms))
     end
@@ -130,13 +173,36 @@ defmodule Hancho.Actions.Implement do
   defp nonempty([]), do: nil
   defp nonempty(value), do: value
 
-  defp progress_callback(context) do
+  defp progress_callback(context, params) do
     fn progress ->
+      progress =
+        Map.merge(progress, %{
+          configured_model: Map.get(params, :model),
+          model_source: model_source(params)
+        })
+
       with :ok <- persist_harness_run(context, progress) do
         write_progress(context, progress)
         :ok
       end
     end
+  end
+
+  defp audit_configuration(context, params, mix_paths, security) do
+    Hancho.Audit.write(Map.get(context, :log, :disabled), "Provider configuration",
+      event: "implement.configuration",
+      metadata: %{
+        provider: params.provider,
+        model: Map.get(params, :model),
+        model_source: model_source(params),
+        mix_paths: Map.drop(mix_paths, [:env]),
+        credential_protection: security.evidence
+      }
+    )
+  end
+
+  defp model_source(params) do
+    if is_binary(Map.get(params, :model)), do: "configured", else: "provider_default_unpinned"
   end
 
   defp write_progress(context, %{phase: :andon} = progress) do
@@ -145,6 +211,18 @@ defmodule Hancho.Actions.Implement do
     Hancho.Audit.write(
       context.log,
       "#{label} Andon: no provider activity for #{andon_duration(progress.inactivity_ms)}",
+      event: event,
+      level: :warning,
+      metadata: progress
+    )
+  end
+
+  defp write_progress(context, %{phase: :productivity_andon} = progress) do
+    {label, event} = productivity_andon_activity(context)
+
+    Hancho.Audit.write(
+      context.log,
+      "#{label} Andon: no productive progress for #{andon_duration(progress.productive_inactivity_ms)}",
       event: event,
       level: :warning,
       metadata: progress
@@ -225,6 +303,12 @@ defmodule Hancho.Actions.Implement do
 
   defp andon_activity(%{activity: :repair}), do: {"Repair", "repair.andon"}
   defp andon_activity(_context), do: {"Implementation", "implement.andon"}
+
+  defp productivity_andon_activity(%{activity: :repair}),
+    do: {"Repair", "repair.productivity_andon"}
+
+  defp productivity_andon_activity(_context),
+    do: {"Implementation", "implement.productivity_andon"}
 
   defp andon_duration(milliseconds) when rem(milliseconds, 1_000) == 0,
     do: "#{div(milliseconds, 1_000)} seconds"

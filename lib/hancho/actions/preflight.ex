@@ -11,25 +11,33 @@ defmodule Hancho.Actions.Preflight do
       })
 
   alias Hancho.Actions.Context
+  alias Hancho.Demand.{Resolver, Snapshot}
 
   @impl true
   def run(%{repo_path: repository, issue_id: issue_id}, context) do
     git = Context.service(context, :git, Hancho.Git)
     beadwork = Context.service(context, :beadwork, Hancho.Beadwork)
+    github = Context.service(context, :github, Hancho.GitHub)
 
     with {:ok, status} <- git.status(working_dir: repository),
          :ok <- clean(status),
          :ok <- attached(status),
          {:ok, baseline} <- git.head(working_dir: repository),
          {:ok, issue} <- beadwork.show(issue_id, working_dir: repository),
-         :ok <- ready_issue(issue, beadwork, repository) do
+         :ok <- ready_issue(issue, beadwork, repository),
+         {:ok, demand} <-
+           Resolver.resolve(issue, repository, beadwork: beadwork, github: github),
+         :ok <- audit_demand(context, demand) do
+      demand = Snapshot.to_map(demand)
+
       {:ok,
        %{
          repo_path: repository,
          issue_id: issue_id,
          baseline: baseline,
          branch: status.branch,
-         issue: issue
+         issue: authoritative_issue(issue, demand),
+         demand: demand
        }}
     end
   end
@@ -59,5 +67,19 @@ defmodule Hancho.Actions.Preflight do
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
+  end
+
+  defp authoritative_issue(issue, demand) do
+    issue
+    |> Map.put("title", demand["title"])
+    |> Map.put("description", demand["body"])
+    |> Map.put("demand_snapshot", demand)
+  end
+
+  defp audit_demand(context, demand) do
+    Hancho.Audit.write(Map.get(context, :log, :disabled), "Authoritative demand snapshot",
+      event: "demand.snapshot",
+      metadata: Snapshot.to_map(demand)
+    )
   end
 end

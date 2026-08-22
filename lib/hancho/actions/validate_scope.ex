@@ -1,5 +1,5 @@
 defmodule Hancho.Actions.ValidateScope do
-  @moduledoc "Checks implementation paths against the Beadwork Allowed Scope."
+  @moduledoc "Checks implementation paths against the authoritative demand scope."
 
   use Jido.Action,
     name: "hancho_validate_scope",
@@ -7,7 +7,8 @@ defmodule Hancho.Actions.ValidateScope do
     schema:
       Zoi.object(%{
         worktree_path: Zoi.string() |> Zoi.min(1),
-        issue: Zoi.map()
+        demand: Zoi.map() |> Zoi.optional(),
+        issue: Zoi.map() |> Zoi.optional()
       })
 
   alias Hancho.Actions.Context
@@ -17,7 +18,7 @@ defmodule Hancho.Actions.ValidateScope do
   @impl true
   def run(params, context) do
     git = Context.service(context, :git, Hancho.Git)
-    description = params.issue["description"] || params.issue[:description] || ""
+    description = scope_description(params)
 
     with {:ok, allowed} <- allowed_scope(description),
          {:ok, status} <-
@@ -26,6 +27,14 @@ defmodule Hancho.Actions.ValidateScope do
       validate(changed, allowed)
     end
   end
+
+  defp scope_description(%{demand: demand}) when is_map(demand),
+    do: demand["body"] || demand[:body] || ""
+
+  defp scope_description(%{issue: issue}) when is_map(issue),
+    do: issue["description"] || issue[:description] || ""
+
+  defp scope_description(_params), do: ""
 
   defp allowed_scope(description) do
     case Regex.named_captures(@section, description) do

@@ -1,7 +1,14 @@
 defmodule Hancho.QueueTest do
   use ExUnit.Case, async: false
 
-  alias Hancho.Workflow.{QueueReconciler, QueueRunner, Result, RunReconciler, Store}
+  alias Hancho.Workflow.{
+    QueueReconciler,
+    QueueReporter,
+    QueueRunner,
+    Result,
+    RunReconciler,
+    Store
+  }
 
   defmodule Beadwork do
     def ready(_options) do
@@ -396,6 +403,83 @@ defmodule Hancho.QueueTest do
     end
   end
 
+  defmodule SummaryStore do
+    def fetch_queue(:summary, "queue-summary") do
+      {:ok,
+       %{
+         "status" => "completed",
+         "current_position" => 2,
+         "started_at" => "2026-08-22T12:00:00Z",
+         "finished_at" => "2026-08-22T12:02:00Z",
+         "error" => nil,
+         "items" => [
+           %{"issue_id" => "task-1", "run_id" => "run-1", "status" => "completed"},
+           %{"issue_id" => "task-2", "run_id" => "run-2", "status" => "completed"}
+         ]
+       }}
+    end
+
+    def fetch_run(:summary, "run-1") do
+      {:ok,
+       run(
+         "2026-08-22T12:00:00Z",
+         "2026-08-22T12:01:00Z",
+         "codex",
+         "gpt-pinned",
+         %{
+           "status" => "available",
+           "scope" => "run",
+           "additive" => true,
+           "values" => %{"input_tokens" => 10, "output_tokens" => 2, "total_tokens" => 12}
+         }
+       )}
+    end
+
+    def fetch_run(:summary, "run-2") do
+      {:ok,
+       run(
+         "2026-08-22T12:01:00Z",
+         "2026-08-22T12:02:00Z",
+         "grok",
+         nil,
+         %{
+           "status" => "available",
+           "scope" => "provider_cumulative",
+           "additive" => false,
+           "values" => %{"total_tokens" => 99_999}
+         }
+       )}
+    end
+
+    defp run(started_at, finished_at, provider, model, usage) do
+      %{
+        "started_at" => started_at,
+        "finished_at" => finished_at,
+        "outputs_json" =>
+          Jason.encode!(%{
+            "implement" => %{
+              "harness_run_id" => "harness-#{provider}",
+              "provider" => provider,
+              "model" => model,
+              "usage" => usage
+            }
+          })
+      }
+    end
+  end
+
+  test "reports per-task elapsed and excludes cumulative usage from queue totals" do
+    assert {:ok, result} =
+             QueueReporter.result(SummaryStore, :summary, "queue-summary", "implement")
+
+    assert result.elapsed_ms == 120_000
+    assert Enum.map(result.task_summaries, & &1["elapsed_ms"]) == [60_000, 60_000]
+    assert Enum.map(result.task_summaries, & &1["model"]) == ["gpt-pinned", nil]
+    assert result.usage_summary["status"] == "partial"
+    assert result.usage_summary["values"]["total_tokens"] == 12
+    assert result.usage_summary["excluded_task_count"] == 1
+  end
+
   test "runs selected tasks serially with verbose reconciliation progress" do
     project = Hancho.Project.new(temporary_directory())
     parent = self()
@@ -461,6 +545,7 @@ defmodule Hancho.QueueTest do
 
     assert preview.settings == %{
              provider: "grok",
+             model: nil,
              reasoning_effort: "xhigh",
              implementation_timeout_ms: 1_800_000,
              verification_timeout_ms: 600_000,

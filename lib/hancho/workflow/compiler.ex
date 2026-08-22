@@ -18,6 +18,7 @@ defmodule Hancho.Workflow.Compiler do
          version: definition.version,
          steps: steps,
          provider: provider_summary(steps),
+         model: model_summary(steps),
          executables: collect(steps, :executable),
          prompt_files: collect(steps, :prompt_file)
        }}
@@ -179,8 +180,9 @@ defmodule Hancho.Workflow.Compiler do
     with {:ok, provider_name} <- literal_param(params, "provider"),
          {:ok, provider} <- Hancho.Actions.Implement.provider(provider_name),
          {:ok, cli} <- optional_literal_param(params, "cli"),
+         {:ok, model} <- optional_literal_param(params, "model"),
          :ok <- provider_environment(provider, cli, options) do
-      {:ok, %{provider: provider_name, cli: cli}}
+      {:ok, %{provider: provider_name, cli: cli, model: model}}
     end
   end
 
@@ -394,6 +396,10 @@ defmodule Hancho.Workflow.Compiler do
 
   defp provider_summary(steps) do
     Enum.find_value(steps, fn step -> step.environment[:provider] end)
+  end
+
+  defp model_summary(steps) do
+    Enum.find_value(steps, fn step -> step.environment[:model] end)
   end
 
   defp collect(steps, key) do

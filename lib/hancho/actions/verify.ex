@@ -22,9 +22,11 @@ defmodule Hancho.Actions.Verify do
   @impl true
   def run(params, context) do
     command = Context.service(context, :command, Hancho.Command)
+    worktree_setup = Context.service(context, :worktree_setup, Hancho.WorktreeSetup)
     executable = System.find_executable(params.executable) || params.executable
 
-    with {:ok, output_path, device} <- open_output(params, context),
+    with {:ok, mix_paths} <- worktree_setup.prepare(params.worktree_path),
+         {:ok, output_path, device} <- open_output(params, context),
          {:ok, tracker} <-
            Agent.start_link(fn -> %{bytes: 0, chunks: 0, next_emit: @progress_bytes} end) do
       try do
@@ -33,7 +35,7 @@ defmodule Hancho.Actions.Verify do
         result =
           command.run(executable, params.arguments,
             cwd: params.worktree_path,
-            env: Hancho.WorktreeCache.environment(params.worktree_path) |> Map.to_list(),
+            env: Map.to_list(mix_paths.env),
             timeout: params.timeout_ms,
             capture_limit: 20_000,
             stderr_to_stdout: true,
@@ -41,6 +43,7 @@ defmodule Hancho.Actions.Verify do
           )
 
         stats = Agent.get(tracker, & &1)
+
         finish(result, output_path, stats, context.log)
       after
         if Process.alive?(tracker), do: Agent.stop(tracker)

@@ -48,16 +48,19 @@ steps:
       prompt_file: implement.md
       context:
         issue: "$steps.claim.issue"
+        demand: "$steps.preflight.demand"
   - name: implement
     role: implementer
     produces: implementation_result
     action: Hancho.Actions.Implement
     params:
       prompt: "$steps.render_prompt.rendered"
+      repo_path: "$steps.preflight.repo_path"
       worktree_path: "$steps.create_worktree.worktree_path"
       timeout_ms: 1800000
       idle_timeout_ms: 300000
       andon_warning_ms: 120000
+      productive_warning_ms: 120000
       progress_interval_ms: 30000
   - name: validate_scope
     role: verifier
@@ -66,7 +69,7 @@ steps:
     action: Hancho.Actions.ValidateScope
     params:
       worktree_path: "$steps.create_worktree.worktree_path"
-      issue: "$steps.claim.issue"
+      demand: "$steps.preflight.demand"
     on_error:
       codes:
         - changes_outside_allowed_scope

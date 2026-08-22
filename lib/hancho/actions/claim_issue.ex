@@ -24,17 +24,26 @@ defmodule Hancho.Actions.ClaimIssue do
       "claim",
       "beadwork.start",
       %{repository: repository, issue_id: issue_id},
-      fn -> reconcile(beadwork, issue_id, repository) end,
+      fn -> reconcile(beadwork, issue, repository) end,
       fn -> start(beadwork, issue, repository) end
     )
   end
 
-  defp reconcile(beadwork, issue_id, repository) do
+  defp reconcile(beadwork, issue, repository) do
+    issue_id = issue["id"] || issue[:id]
+
     case beadwork.show(issue_id, working_dir: repository) do
-      {:ok, %{"status" => "in_progress"} = issue} -> {:ok, %{issue: issue}}
-      {:ok, %{"status" => "open"}} -> :not_applied
-      {:ok, _issue} -> {:error, "The Beadwork task cannot be claimed."}
-      {:error, reason} -> {:error, reason}
+      {:ok, %{"status" => "in_progress"} = claimed} ->
+        {:ok, %{issue: preserve_demand(claimed, issue)}}
+
+      {:ok, %{"status" => "open"}} ->
+        :not_applied
+
+      {:ok, _issue} ->
+        {:error, "The Beadwork task cannot be claimed."}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -42,8 +51,21 @@ defmodule Hancho.Actions.ClaimIssue do
     issue_id = issue["id"] || issue[:id]
 
     case beadwork.start(issue_id, working_dir: repository) do
-      {:ok, claimed} -> {:ok, %{issue: claimed}}
+      {:ok, claimed} -> {:ok, %{issue: preserve_demand(claimed, issue)}}
       {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp preserve_demand(claimed, source) do
+    case source["demand_snapshot"] || source[:demand_snapshot] do
+      demand when is_map(demand) ->
+        claimed
+        |> Map.put("title", demand["title"] || demand[:title])
+        |> Map.put("description", demand["body"] || demand[:body] || "")
+        |> Map.put("demand_snapshot", demand)
+
+      _other ->
+        claimed
     end
   end
 end

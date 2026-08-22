@@ -77,6 +77,7 @@ defmodule Hancho.CLITest do
          repository: %{branch: "main", head: "abc123", clean: true, worktrees: ["retained"]},
          settings: %{
            provider: "grok",
+           model: nil,
            reasoning_effort: "xhigh",
            implementation_timeout_ms: 1_800_000,
            verification_timeout_ms: 600_000,
@@ -121,6 +122,51 @@ defmodule Hancho.CLITest do
         child_runs: ["queue-failed-001"],
         error: %{code: "workflow_stopped"},
         forensic_report: "/repo/.hancho/forensics/queues/queue-failed.json"
+      })
+    end
+  end
+
+  defmodule SummaryQueueRunner do
+    def run(_project, "implement", "beadwork-ready", 2, _options) do
+      Hancho.Workflow.QueueResult.new(%{
+        queue_id: "queue-summary",
+        workflow: "implement",
+        status: :completed,
+        completed_count: 2,
+        total_count: 2,
+        current_issue: nil,
+        child_runs: ["run-1", "run-2"],
+        elapsed_ms: 120_000,
+        task_summaries: [
+          %{
+            "issue_id" => "task-1",
+            "elapsed_ms" => 60_000,
+            "provider" => "codex",
+            "model" => "gpt-pinned",
+            "usage" => %{
+              "status" => "available",
+              "scope" => "run",
+              "values" => %{"total_tokens" => 12}
+            }
+          },
+          %{
+            "issue_id" => "task-2",
+            "elapsed_ms" => 60_000,
+            "provider" => "grok",
+            "model" => nil,
+            "usage" => %{
+              "status" => "available",
+              "scope" => "provider_cumulative",
+              "values" => %{"total_tokens" => 99_999}
+            }
+          }
+        ],
+        usage_summary: %{
+          "status" => "partial",
+          "values" => %{"total_tokens" => 12},
+          "excluded_task_count" => 1
+        },
+        error: nil
       })
     end
   end
@@ -404,6 +450,24 @@ defmodule Hancho.CLITest do
     assert project.root == "/repo"
   end
 
+  test "prints normalized queue time, model, and usage summaries" do
+    output =
+      capture_io(fn ->
+        assert Hancho.CLI.run(
+                 ["queue", "implement", "--source", "beadwork-ready", "--count", "2"],
+                 cwd: "/repo",
+                 project_api: ProjectAPI,
+                 queue_runner: SummaryQueueRunner
+               ) == 0
+      end)
+
+    assert output =~ "Queue summary: 2/2 tasks, 120000 ms elapsed"
+    assert output =~ "task-1: 60000 ms; codex; gpt-pinned; usage run, 12 total tokens"
+    assert output =~ "task-2: 60000 ms; grok; provider default; not pinned"
+    assert output =~ "1 non-additive task values excluded"
+    refute output =~ "100011"
+  end
+
   test "requires explicit queue source and count" do
     output =
       capture_io(:stderr, fn ->
@@ -437,6 +501,7 @@ defmodule Hancho.CLITest do
                "Repository: main at abc123 (clean)\n" <>
                "Retained worktrees: 1\n" <>
                "Provider: grok\n" <>
+               "Model: not configured (provider default; not pinned)\n" <>
                "Reasoning effort: xhigh\n" <>
                "Timeouts: implement 1800000 ms, verify 600000 ms\n" <>
                "Repair: validate_scope via grok, 1 attempt (changes_outside_allowed_scope)\n" <>

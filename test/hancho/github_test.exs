@@ -11,32 +11,37 @@ defmodule Hancho.GitHubTest do
     def run("/test/gh", ["api", "graphql" | arguments], options) do
       send(self(), {:graphql, arguments, options})
 
-      output =
-        Jason.encode!(%{
-          "data" => %{
+      issue = %{
+        "id" => "node-1",
+        "number" => 1,
+        "title" => "Demand",
+        "url" => "https://github.test/owner/repo/issues/1",
+        "state" => "OPEN",
+        "body" => "Acceptance",
+        "updatedAt" => "2026-08-22T12:00:00Z",
+        "parent" => nil,
+        "subIssues" => %{"totalCount" => 0},
+        "comments" => %{
+          "pageInfo" => %{"hasNextPage" => false},
+          "nodes" => [%{"body" => "Hancho-Beadwork-Epic: bw-1"}]
+        }
+      }
+
+      data =
+        if "id=node-1" in arguments do
+          %{"node" => Map.put(issue, "repository", %{"nameWithOwner" => "owner/repo"})}
+        else
+          %{
             "repository" => %{
               "issues" => %{
                 "pageInfo" => %{"hasNextPage" => false},
-                "nodes" => [
-                  %{
-                    "id" => "node-1",
-                    "number" => 1,
-                    "title" => "Demand",
-                    "url" => "https://github.test/owner/repo/issues/1",
-                    "state" => "OPEN",
-                    "body" => "Acceptance",
-                    "parent" => nil,
-                    "subIssues" => %{"totalCount" => 0},
-                    "comments" => %{
-                      "pageInfo" => %{"hasNextPage" => false},
-                      "nodes" => [%{"body" => "Hancho-Beadwork-Epic: bw-1"}]
-                    }
-                  }
-                ]
+                "nodes" => [issue]
               }
             }
           }
-        })
+        end
+
+      output = Jason.encode!(%{"data" => data})
 
       {:ok, %Result{stdout: output, stderr: "", exit_status: 0}}
     end
@@ -57,6 +62,7 @@ defmodule Hancho.GitHubTest do
 
     assert issue.node_id == "node-1"
     assert issue.number == 1
+    assert issue.updated_at == "2026-08-22T12:00:00Z"
     assert issue.comments == ["Hancho-Beadwork-Epic: bw-1"]
     assert_received {:graphql, arguments, [cwd: "/repo", stderr_to_stdout: true]}
     assert "owner=owner" in arguments
@@ -69,5 +75,21 @@ defmodule Hancho.GitHubTest do
              )
 
     assert_received {:comment, "body=Hancho-Beadwork-Epic: bw-1"}
+  end
+
+  test "fetches one authoritative issue by node ID and validates its repository" do
+    assert {:ok, issue} =
+             Hancho.GitHub.fetch("node-1",
+               executable: "/test/gh",
+               command: Command,
+               working_dir: "/repo"
+             )
+
+    assert issue.repository == "owner/repo"
+    assert issue.body == "Acceptance"
+    assert issue.updated_at == "2026-08-22T12:00:00Z"
+    assert_received {:graphql, arguments, _options}
+    assert "id=node-1" in arguments
+    assert Enum.any?(arguments, &String.contains?(&1, "updatedAt"))
   end
 end

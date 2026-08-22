@@ -3,6 +3,7 @@ defmodule Hancho.Harness do
 
   @default_progress_interval_ms 30_000
   @default_andon_warning_ms 120_000
+  @default_productive_warning_ms 120_000
   @default_event_poll_interval_ms 500
   @default_cancellation_timeout_ms 30_000
 
@@ -32,6 +33,9 @@ defmodule Hancho.Harness do
     andon_warning_ms =
       Keyword.get(options, :andon_warning_ms, @default_andon_warning_ms)
 
+    productive_warning_ms =
+      Keyword.get(options, :productive_warning_ms, @default_productive_warning_ms)
+
     cancellation_timeout =
       Keyword.get(options, :cancellation_timeout_ms, @default_cancellation_timeout_ms)
 
@@ -48,6 +52,7 @@ defmodule Hancho.Harness do
         :await_timeout,
         :progress_interval_ms,
         :andon_warning_ms,
+        :productive_warning_ms,
         :cancellation_timeout_ms,
         :resume_run_id,
         :resume_cursor,
@@ -71,7 +76,8 @@ defmodule Hancho.Harness do
                  callback,
                  event_callback,
                  event_poll_interval,
-                 andon_warning_ms
+                 andon_warning_ms,
+                 productive_warning_ms
                ) do
           {:ok, result}
         end
@@ -124,7 +130,8 @@ defmodule Hancho.Harness do
          callback,
          event_callback,
          event_poll_interval,
-         andon_warning_ms
+         andon_warning_ms,
+         productive_warning_ms
        ) do
     started_at = System.monotonic_time(:millisecond)
     deadline = deadline(started_at, timeout)
@@ -146,7 +153,12 @@ defmodule Hancho.Harness do
       event_callback,
       andon_warning_ms,
       started_at,
-      false
+      false,
+      productive_warning_ms,
+      started_at,
+      false,
+      0,
+      nil
     )
   end
 
@@ -164,7 +176,12 @@ defmodule Hancho.Harness do
          event_callback,
          andon_warning_ms,
          last_activity_at,
-         andon_warned?
+         andon_warned?,
+         productive_warning_ms,
+         last_productive_at,
+         productive_warned?,
+         productive_event_count,
+         last_productive
        ) do
     wait = wait_time(deadline, poll_interval)
 
@@ -191,8 +208,22 @@ defmodule Hancho.Harness do
           {last_activity_at, andon_warned?} =
             activity_state(events, now, last_activity_at, andon_warned?)
 
+          {last_productive_at, productive_warned?, productive_event_count, last_productive} =
+            productivity_state(
+              events,
+              now,
+              last_productive_at,
+              productive_warned?,
+              productive_event_count,
+              last_productive
+            )
+
           warn? =
             not andon_warned? and now - last_activity_at >= andon_warning_ms
+
+          productive_warn? =
+            not productive_warned? and
+              now - last_productive_at >= productive_warning_ms
 
           with :ok <- notify_events(event_callback, events),
                :ok <-
@@ -206,6 +237,20 @@ defmodule Hancho.Harness do
                    latest,
                    now - last_activity_at,
                    andon_warning_ms
+                 ),
+               :ok <-
+                 maybe_notify_productivity_andon(
+                   callback,
+                   productive_warn?,
+                   run_id,
+                   provider,
+                   started_at,
+                   next_cursor,
+                   latest,
+                   now - last_productive_at,
+                   productive_warning_ms,
+                   productive_event_count,
+                   last_productive
                  ),
                :ok <-
                  maybe_notify_progress(
@@ -232,7 +277,12 @@ defmodule Hancho.Harness do
               event_callback,
               andon_warning_ms,
               last_activity_at,
-              andon_warned? or warn?
+              andon_warned? or warn?,
+              productive_warning_ms,
+              last_productive_at,
+              productive_warned? or productive_warn?,
+              productive_event_count,
+              last_productive
             )
           end
         end
@@ -296,6 +346,44 @@ defmodule Hancho.Harness do
   defp activity_state(_events, now, _last_activity_at, _andon_warned?),
     do: {now, false}
 
+  defp productivity_state(
+         events,
+         now,
+         last_productive_at,
+         productive_warned?,
+         productive_event_count,
+         last_productive
+       ) do
+    productive = Enum.filter(events, &productive_event?/1)
+
+    case List.last(productive) do
+      nil ->
+        {last_productive_at, productive_warned?, productive_event_count, last_productive}
+
+      event ->
+        {now, false, productive_event_count + length(productive), event.type}
+    end
+  end
+
+  defp productive_event?(%{type: :file_change}), do: true
+
+  defp productive_event?(%{type: :tool_result, payload: payload}) do
+    not truthy?(payload["is_error"] || payload[:is_error]) and
+      test_evidence?(payload["output"] || payload[:output])
+  end
+
+  defp productive_event?(_event), do: false
+
+  defp test_evidence?(output) when is_binary(output) do
+    Regex.match?(
+      ~r/(\d+\s+tests?|\d+\s+passed|0 failures|test result|mix check|compil(?:e|ed))/i,
+      output
+    )
+  end
+
+  defp test_evidence?(_output), do: false
+  defp truthy?(value), do: value in [true, "true", 1]
+
   defp maybe_notify_andon(
          _callback,
          false,
@@ -328,6 +416,50 @@ defmodule Hancho.Harness do
     callback
     |> notify(
       Map.merge(progress(run_id, provider, :andon, elapsed(started_at), cursor, latest), details)
+    )
+  end
+
+  defp maybe_notify_productivity_andon(
+         _callback,
+         false,
+         _run_id,
+         _provider,
+         _started_at,
+         _cursor,
+         _latest,
+         _inactivity_ms,
+         _warning_ms,
+         _event_count,
+         _last_productive
+       ),
+       do: :ok
+
+  defp maybe_notify_productivity_andon(
+         callback,
+         true,
+         run_id,
+         provider,
+         started_at,
+         cursor,
+         latest,
+         inactivity_ms,
+         warning_ms,
+         event_count,
+         last_productive
+       ) do
+    details = %{
+      productive_inactivity_ms: inactivity_ms,
+      productive_warning_ms: warning_ms,
+      productive_event_count: event_count,
+      last_productive_event: last_productive
+    }
+
+    notify(
+      callback,
+      Map.merge(
+        progress(run_id, provider, :productivity_andon, elapsed(started_at), cursor, latest),
+        details
+      )
     )
   end
 

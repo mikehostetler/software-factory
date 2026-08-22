@@ -11,6 +11,7 @@ defmodule Hancho.GitHub.Issue do
               url: Zoi.string() |> Zoi.min(1),
               state: Zoi.string() |> Zoi.min(1),
               body: Zoi.string() |> Zoi.nullish() |> Zoi.default(nil),
+              updated_at: Zoi.string() |> Zoi.nullish() |> Zoi.default(nil),
               parent_node_id: Zoi.string() |> Zoi.nullish() |> Zoi.default(nil),
               comments: Zoi.array(Zoi.string()) |> Zoi.default([]),
               child_count: Zoi.integer() |> Zoi.min(0) |> Zoi.default(0)

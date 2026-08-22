@@ -60,6 +60,28 @@ defmodule Hancho.ActionsTest do
     end
   end
 
+  defmodule WorktreeSetup do
+    def prepare(_workspace) do
+      {:ok,
+       %{
+         env: %{"MIX_DEPS_PATH" => "/workspace/deps", "MIX_BUILD_PATH" => "/workspace/build"},
+         deps_path: "/workspace/deps",
+         build_path: "/workspace/build"
+       }}
+    end
+  end
+
+  defmodule FailingWorktreeSetup do
+    def prepare(_workspace), do: {:error, :mix_path_not_writable}
+  end
+
+  defmodule MustNotRunHarness do
+    def run(_provider, _prompt, _options) do
+      send(self(), :unexpected_provider_run)
+      {:error, :must_not_run}
+    end
+  end
+
   defmodule ProgressHarness do
     def run_with_progress(:codex, _prompt, options, callback) do
       25 = options[:progress_interval_ms]
@@ -114,6 +136,9 @@ defmodule Hancho.ActionsTest do
       :workspace_write = options[:sandbox_mode]
       nil = options[:reasoning_effort]
       %{extra_args: ["--reasoning-effort=xhigh"]} = options[:provider_options]
+      deny_rules = options[:provider_options][:deny_rules]
+      true = Enum.any?(deny_rules, &String.contains?(&1, ".config/gh/hosts.yml"))
+      true = Enum.any?(deny_rules, &String.contains?(&1, ".env"))
       event_callback = options[:event_callback]
       true = is_function(event_callback, 1)
       500 = options[:event_poll_interval_ms]
@@ -243,11 +268,31 @@ defmodule Hancho.ActionsTest do
                  provider: "codex",
                  timeout_ms: 1_000
                },
-               %{services: %{harness: Harness}}
+               %{services: %{harness: Harness, worktree_setup: WorktreeSetup}}
              )
 
     assert result.status == :completed
     assert result.harness_run_id == "harness-1"
+  end
+
+  test "fails Mix path setup before provider execution" do
+    assert {:error, :mix_path_not_writable} =
+             Actions.Implement.run(
+               %{
+                 prompt: "Implement hancho-123",
+                 worktree_path: "/repo/.hancho/worktrees/run-1",
+                 provider: "codex",
+                 timeout_ms: 1_000
+               },
+               %{
+                 services: %{
+                   harness: MustNotRunHarness,
+                   worktree_setup: FailingWorktreeSetup
+                 }
+               }
+             )
+
+    refute_received :unexpected_provider_run
   end
 
   test "selects a clean repository as an explicit in-place workspace" do
@@ -295,7 +340,7 @@ defmodule Hancho.ActionsTest do
                  timeout_ms: 1_000,
                  progress_interval_ms: 25
                },
-               %{services: %{harness: ProgressHarness}, log: log}
+               %{services: %{harness: ProgressHarness, worktree_setup: WorktreeSetup}, log: log}
              )
 
     assert result.harness_run_id == "harness-progress"
@@ -340,7 +385,11 @@ defmodule Hancho.ActionsTest do
                      timeout_ms: 1_000,
                      progress_interval_ms: 25
                    },
-                   %{services: %{harness: VerboseHarness}, log: :disabled, verbose: true}
+                   %{
+                     services: %{harness: VerboseHarness, worktree_setup: WorktreeSetup},
+                     log: :disabled,
+                     verbose: true
+                   }
                  )
 
         assert result.harness_run_id == "harness-verbose"
@@ -406,7 +455,10 @@ defmodule Hancho.ActionsTest do
                  arguments: ["test"],
                  timeout_ms: 1_000
                },
-               %{services: %{command: Command}, log: :disabled}
+               %{
+                 services: %{command: Command, worktree_setup: WorktreeSetup},
+                 log: :disabled
+               }
              )
 
     assert result.exit_status == 0

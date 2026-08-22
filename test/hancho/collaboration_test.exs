@@ -20,7 +20,8 @@ defmodule Hancho.CollaborationTest do
          run_id: "role-run",
          provider: provider,
          status: :completed,
-         text: "done"
+         text: "done",
+         usage: %{"input_tokens" => 2, "output_tokens" => 1, "total_tokens" => 3}
        })}
     end
   end
@@ -174,19 +175,36 @@ defmodule Hancho.CollaborationTest do
     assert Hancho.Cockpit.page() =~ "Role handoffs"
   end
 
-  test "uses one dependency and build cache for serial worktrees" do
+  test "uses writable Mix paths in each isolated worktree" do
     project = project()
-    File.write!(Path.join(project.root, "mix.exs"), "defmodule CacheProject do\nend\n")
-    first = Hancho.WorktreeCache.environment(project.root)
-    second = Hancho.WorktreeCache.environment(Path.join(project.root, ".hancho/worktrees/run-1"))
-    assert first == second
-    assert first["MIX_DEPS_PATH"] == Path.join(project.root, "deps")
-    assert first["MIX_BUILD_PATH"] == Path.join(project.root, "_build")
-    assert File.dir?(first["MIX_DEPS_PATH"])
-    assert File.dir?(first["MIX_BUILD_PATH"])
+    first_workspace = Path.join(project.root, ".hancho/worktrees/run-1")
+    second_workspace = Path.join(project.root, ".hancho/worktrees/run-2")
+    File.mkdir_p!(first_workspace)
+    File.mkdir_p!(second_workspace)
+
+    assert {:ok, first} = Hancho.WorktreeSetup.prepare(first_workspace)
+    assert {:ok, second} = Hancho.WorktreeSetup.prepare(second_workspace)
+
+    assert first.env != second.env
+    assert first.env["MIX_DEPS_PATH"] == Path.join(first_workspace, "deps")
+    assert first.env["MIX_BUILD_PATH"] == Path.join(first_workspace, "_build")
+    assert second.env["MIX_DEPS_PATH"] == Path.join(second_workspace, "deps")
+    assert second.env["MIX_BUILD_PATH"] == Path.join(second_workspace, "_build")
+
+    File.write!(Path.join(first.env["MIX_DEPS_PATH"], "local.bin"), "first")
+    refute File.exists?(Path.join(second.env["MIX_DEPS_PATH"], "local.bin"))
+
+    unsafe_workspace = Path.join(project.root, ".hancho/worktrees/run-unsafe")
+    outside = Path.join(project.root, "outside-deps")
+    File.mkdir_p!(unsafe_workspace)
+    File.mkdir_p!(outside)
+    File.ln_s!(outside, Path.join(unsafe_workspace, "deps"))
+
+    assert {:error, {:mix_path_is_symlink, "deps"}} =
+             Hancho.WorktreeSetup.prepare(unsafe_workspace)
   end
 
-  test "passes role CLI, model, reasoning, and cache settings to Harness" do
+  test "passes role CLI, model, reasoning, and worktree Mix paths to Harness" do
     project = project()
 
     assert {:ok, result} =
@@ -208,11 +226,40 @@ defmodule Hancho.CollaborationTest do
              )
 
     assert result.model == "gpt-test"
+    assert result.model_source == "configured"
+    assert result.usage["scope"] == "run"
+    assert result.usage["additive"]
     assert_receive {:harness_options, :codex, "Implement it.", options}
     assert options[:model] == "gpt-test"
     assert options[:reasoning_effort] == :high
     assert options[:provider_options][:cli_path] == "/opt/tools/codex"
     assert options[:env]["MIX_DEPS_PATH"]
+  end
+
+  test "passes Claude credential deny settings through Harness" do
+    project = project()
+
+    assert {:ok, result} =
+             Hancho.Actions.Implement.run(
+               %{
+                 prompt: "Implement it.",
+                 worktree_path: project.root,
+                 provider: "claude",
+                 timeout_ms: 1_000,
+                 idle_timeout_ms: 1_000,
+                 andon_warning_ms: 500,
+                 progress_interval_ms: 250
+               },
+               %{services: %{harness: RoleHarness}}
+             )
+
+    assert result.credential_protection.enforced
+    assert result.credential_protection.profile == "claude_permission_rules"
+    assert_receive {:harness_options, :claude, "Implement it.", options}
+    settings = Jason.decode!(options[:provider_options][:settings])
+    rules = get_in(settings, ["permissions", "deny"])
+    assert Enum.any?(rules, &String.contains?(&1, ".ssh/id_*"))
+    assert Enum.any?(rules, &String.contains?(&1, ".aws/credentials"))
   end
 
   test "attention action waits and then returns the durable answer" do

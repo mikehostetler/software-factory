@@ -368,6 +368,7 @@ defmodule Hancho.CLI do
     IO.puts("Repository: #{preview.repository.branch} at #{preview.repository.head} (clean)")
     IO.puts("Retained worktrees: #{length(preview.repository.worktrees)}")
     IO.puts("Provider: #{preview.settings.provider || "not configured"}")
+    IO.puts("Model: #{configured_model(Map.get(preview.settings, :model))}")
     IO.puts("Reasoning effort: #{preview.settings.reasoning_effort || "not configured"}")
 
     IO.puts(
@@ -398,6 +399,9 @@ defmodule Hancho.CLI do
 
   defp format_milliseconds(value) when is_integer(value), do: "#{value} ms"
   defp format_milliseconds(_value), do: "not configured"
+
+  defp configured_model(value) when is_binary(value), do: "#{value} (configured)"
+  defp configured_model(_value), do: "not configured (provider default; not pinned)"
 
   defp print_usage do
     IO.puts(@usage)
@@ -431,7 +435,10 @@ defmodule Hancho.CLI do
     1
   end
 
-  defp print_queue_result(%Hancho.Workflow.QueueResult{status: :completed}), do: 0
+  defp print_queue_result(%Hancho.Workflow.QueueResult{status: :completed} = result) do
+    print_queue_summary(result)
+    0
+  end
 
   defp print_queue_result(%Hancho.Workflow.QueueResult{status: :stopped} = result) do
     IO.puts(
@@ -440,9 +447,51 @@ defmodule Hancho.CLI do
     )
 
     if result.forensic_report, do: IO.puts(:stderr, "Forensic report: #{result.forensic_report}")
+    print_queue_summary(result, :stderr)
 
     1
   end
+
+  defp print_queue_summary(result, device \\ :stdio) do
+    if result.elapsed_ms || result.task_summaries != [] do
+      IO.puts(
+        device,
+        "Queue summary: #{result.completed_count}/#{result.total_count} tasks, #{format_duration(result.elapsed_ms)} elapsed"
+      )
+
+      Enum.each(result.task_summaries, fn task ->
+        model = task["model"] || "provider default; not pinned"
+
+        IO.puts(
+          device,
+          "- #{task["issue_id"]}: #{format_duration(task["elapsed_ms"])}; #{task["provider"] || "no provider"}; #{model}; #{task_usage(task["usage"])}"
+        )
+      end)
+
+      IO.puts(device, queue_usage(result.usage_summary))
+    end
+  end
+
+  defp task_usage(%{"status" => "available"} = usage) do
+    total = get_in(usage, ["values", "total_tokens"])
+    suffix = if is_number(total), do: ", #{total} total tokens", else: ""
+    "usage #{usage["scope"]}#{suffix}"
+  end
+
+  defp task_usage(_usage), do: "usage unavailable"
+
+  defp queue_usage(%{"status" => "available", "values" => values}),
+    do: "Queue usage: additive run totals #{inspect(values)}"
+
+  defp queue_usage(%{"status" => "partial", "values" => values} = usage) do
+    "Queue usage: additive totals #{inspect(values)}; #{usage["excluded_task_count"]} non-additive task values excluded"
+  end
+
+  defp queue_usage(%{"status" => "non_additive"} = usage) do
+    "Queue usage: provider-cumulative or unknown values; #{usage["excluded_task_count"]} task values not added"
+  end
+
+  defp queue_usage(_usage), do: "Queue usage: unavailable"
 
   defp print_run_report(report) do
     location = if report.current_step, do: " at #{report.current_step}", else: ""
@@ -588,6 +637,19 @@ defmodule Hancho.CLI do
   defp print_provider(provider) do
     identity = provider["harness_run_id"] || "unknown run"
     IO.puts("Provider: #{provider["provider"]} #{provider["status"]} (#{identity})")
+    IO.puts("Model: #{configured_model(provider["model"])}")
+    print_provider_usage(provider["usage"])
+  end
+
+  defp print_provider_usage(nil), do: :ok
+
+  defp print_provider_usage(%{"status" => "unavailable"}),
+    do: IO.puts("Provider usage: unavailable")
+
+  defp print_provider_usage(usage) do
+    total = get_in(usage, ["values", "total_tokens"])
+    detail = if is_number(total), do: ", #{total} total tokens", else: ""
+    IO.puts("Provider usage: #{usage["scope"]}#{detail}")
   end
 
   defp print_verification(nil), do: IO.puts("Verification: not started")

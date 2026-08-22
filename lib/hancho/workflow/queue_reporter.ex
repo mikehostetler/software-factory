@@ -9,6 +9,7 @@ defmodule Hancho.Workflow.QueueReporter do
     with {:ok, queue} <- store_api.fetch_queue(store, queue_id) do
       completed_count = Enum.count(queue["items"], &(&1["status"] == "completed"))
       current = Enum.at(queue["items"], queue["current_position"])
+      task_summaries = Enum.map(queue["items"], &task_summary(store_api, store, &1))
 
       QueueResult.new(%{
         queue_id: queue_id,
@@ -18,9 +19,79 @@ defmodule Hancho.Workflow.QueueReporter do
         total_count: length(queue["items"]),
         current_issue: if(current, do: current["issue_id"]),
         child_runs: Enum.map(queue["items"], & &1["run_id"]),
+        elapsed_ms: duration(queue["started_at"], queue["finished_at"]),
+        task_summaries: task_summaries,
+        usage_summary:
+          task_summaries
+          |> Enum.map(& &1["usage"])
+          |> Hancho.ProviderUsage.summarize(),
         error: queue["error"],
         forensic_report: forensic_report(queue["error"])
       })
+    end
+  end
+
+  defp task_summary(store_api, store, item) do
+    base = %{
+      "issue_id" => item["issue_id"],
+      "run_id" => item["run_id"],
+      "status" => item["status"],
+      "elapsed_ms" => nil,
+      "provider" => nil,
+      "model" => nil,
+      "usage" => unavailable_usage()
+    }
+
+    if function_exported?(store_api, :fetch_run, 2) do
+      case store_api.fetch_run(store, item["run_id"]) do
+        {:ok, run} ->
+          implementation = implementation_result(run["outputs_json"])
+
+          Map.merge(base, %{
+            "elapsed_ms" => duration(run["started_at"], run["finished_at"]),
+            "provider" => implementation["provider"],
+            "model" => implementation["model"],
+            "usage" => implementation["usage"] || unavailable_usage()
+          })
+
+        {:error, _reason} ->
+          base
+      end
+    else
+      base
+    end
+  end
+
+  defp implementation_result(json) when is_binary(json) do
+    with {:ok, outputs} when is_map(outputs) <- Jason.decode(json) do
+      Enum.find_value(outputs, %{}, fn {_step, result} ->
+        if is_map(result) and is_binary(result["harness_run_id"]), do: result
+      end)
+    else
+      _error -> %{}
+    end
+  end
+
+  defp implementation_result(_json), do: %{}
+
+  defp unavailable_usage do
+    %{
+      "status" => "unavailable",
+      "scope" => "unavailable",
+      "additive" => false,
+      "values" => %{}
+    }
+  end
+
+  defp duration(nil, _finished_at), do: nil
+  defp duration(_started_at, nil), do: nil
+
+  defp duration(started_at, finished_at) do
+    with {:ok, started, _offset} <- DateTime.from_iso8601(started_at),
+         {:ok, finished, _offset} <- DateTime.from_iso8601(finished_at) do
+      max(DateTime.diff(finished, started, :millisecond), 0)
+    else
+      _error -> nil
     end
   end
 
