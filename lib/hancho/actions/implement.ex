@@ -141,18 +141,15 @@ defmodule Hancho.Actions.Implement do
   defp approval_mode(:grok), do: :auto_approve
   defp approval_mode(_provider), do: :auto_edit
 
-  # Jido Harness currently stops its provider-neutral enum at :high. Grok 1.0.5
-  # accepts xhigh through its documented --reasoning-effort option.
-  defp reasoning_options(:grok, "xhigh") do
-    [reasoning_effort: nil, provider_options: %{extra_args: ["--reasoning-effort=xhigh"]}]
-  end
+  defp reasoning_options(provider, "xhigh") when provider in [:codex, :grok],
+    do: [reasoning_effort: :xhigh]
 
   defp reasoning_options(_provider, nil), do: [reasoning_effort: nil]
   defp reasoning_options(_provider, "low"), do: [reasoning_effort: :low]
   defp reasoning_options(_provider, "medium"), do: [reasoning_effort: :medium]
   defp reasoning_options(_provider, "high"), do: [reasoning_effort: :high]
 
-  defp validate_reasoning(:grok, "xhigh"), do: :ok
+  defp validate_reasoning(provider, "xhigh") when provider in [:codex, :grok], do: :ok
 
   defp validate_reasoning(_provider, "xhigh"),
     do: {:error, "The selected Harness provider does not support xhigh reasoning."}

@@ -12,7 +12,7 @@ defmodule Hancho.TestHarnessAdapter do
       name: "Hancho deterministic test adapter",
       executable: "hancho-test-adapter",
       capabilities: %Capabilities{streaming?: true, file_changes?: true},
-      normalized_options: [:approval_mode, :sandbox_mode],
+      normalized_options: [:approval_mode, :sandbox_mode, :reasoning_effort],
       provider_options: []
     }
   end

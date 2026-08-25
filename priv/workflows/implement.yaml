@@ -3,6 +3,7 @@ version: 1
 roles:
   implementer:
     provider: codex
+    reasoning_effort: xhigh
     prompt: |
       You are the implementation role. Make the smallest complete change and preserve repository rules.
   verifier:

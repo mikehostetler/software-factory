@@ -130,12 +130,25 @@ defmodule Hancho.ActionsTest do
     end
   end
 
+  defmodule CodexXhighHarness do
+    def run_with_progress(:codex, _prompt, options, _callback) do
+      :xhigh = options[:reasoning_effort]
+
+      {:ok,
+       Jido.Harness.RunResult.new!(%{
+         run_id: "harness-codex-xhigh",
+         provider: :codex,
+         status: :completed,
+         text: "implemented"
+       })}
+    end
+  end
+
   defmodule VerboseHarness do
     def run_with_progress(:grok, _prompt, options, callback) do
       :auto_approve = options[:approval_mode]
       :workspace_write = options[:sandbox_mode]
-      nil = options[:reasoning_effort]
-      %{extra_args: ["--reasoning-effort=xhigh"]} = options[:provider_options]
+      :xhigh = options[:reasoning_effort]
       deny_rules = options[:provider_options][:deny_rules]
       true = Enum.any?(deny_rules, &String.contains?(&1, ".config/gh/hosts.yml"))
       true = Enum.any?(deny_rules, &String.contains?(&1, ".env"))
@@ -273,6 +286,23 @@ defmodule Hancho.ActionsTest do
 
     assert result.status == :completed
     assert result.harness_run_id == "harness-1"
+  end
+
+  test "passes Codex xhigh reasoning to Harness" do
+    assert {:ok, result} =
+             Jido.Exec.run(
+               Actions.Implement,
+               %{
+                 prompt: "Implement hancho-123",
+                 worktree_path: "/repo/.hancho/worktrees/run-1",
+                 provider: "codex",
+                 reasoning_effort: "xhigh",
+                 timeout_ms: 1_000
+               },
+               %{services: %{harness: CodexXhighHarness, worktree_setup: WorktreeSetup}}
+             )
+
+    assert result.harness_run_id == "harness-codex-xhigh"
   end
 
   test "fails Mix path setup before provider execution" do

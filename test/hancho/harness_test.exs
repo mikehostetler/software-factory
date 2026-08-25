@@ -1,7 +1,7 @@
 defmodule Hancho.HarnessTest do
   use ExUnit.Case, async: false
 
-  alias Jido.Harness.{AdapterSpec, Capabilities, ProviderStatus}
+  alias Jido.Harness.{AdapterSpec, Capabilities, Event, ProviderStatus}
 
   defmodule SlowAdapter do
     @behaviour Jido.Harness.Adapter
@@ -78,6 +78,19 @@ defmodule Hancho.HarnessTest do
     assert Hancho.Harness.ensure_started() == :ok
     assert is_binary(Jido.Harness.version())
     assert Jido.Harness.providers() != []
+  end
+
+  test "passes Codex xhigh through the pinned Harness adapter" do
+    :ok = Hancho.Harness.ensure_started()
+
+    assert {:ok, request} =
+             Jido.Harness.RequestResolver.resolve(:codex, %{
+               prompt: "task",
+               reasoning_effort: :xhigh
+             })
+
+    assert {:ok, argv} = Jido.Harness.Adapters.Codex.build_argv(request, %{})
+    assert "model_reasoning_effort=\"xhigh\"" in config_values(argv)
   end
 
   test "reports detached run identity and normalized progress" do
@@ -316,6 +329,15 @@ defmodule Hancho.HarnessTest do
     File.mkdir_p!(path)
     on_exit(fn -> File.rm_rf!(path) end)
     path
+  end
+
+  defp config_values(argv) do
+    argv
+    |> Enum.chunk_every(2, 1, :discard)
+    |> Enum.flat_map(fn
+      ["--config", value] -> [value]
+      _pair -> []
+    end)
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:jido_harness, key)

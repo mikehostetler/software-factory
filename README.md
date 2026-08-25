@@ -147,8 +147,8 @@ prompt is added before the task prompt. Hancho resolves a role prompt file when
 it loads the workflow and embeds the file content in the durable workflow
 snapshot. A retry therefore does not read a changed prompt file. The selected
 provider must support the requested model, reasoning effort, and extra
-arguments. `xhigh` currently uses the Grok adapter because the normalized
-Harness reasoning enum stops at `high`.
+arguments. `xhigh` is supported for Codex and Grok through the normalized
+Harness reasoning option.
 
 Set `model` to pin a provider model. Hancho sends that exact configured value
 to Harness and records it in dry-run output, provider progress, and the durable

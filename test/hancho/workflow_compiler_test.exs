@@ -35,6 +35,11 @@ defmodule Hancho.WorkflowCompilerTest do
     assert compiled.provider == "codex"
     assert length(compiled.steps) == 11
 
+    implement = Enum.find(definition.steps, &(&1.name == "implement"))
+    params = Hancho.Workflow.RoleResolver.params(definition, implement)
+    assert params["provider"] == "codex"
+    assert params["reasoning_effort"] == "xhigh"
+
     assert Enum.find(compiled.steps, &(&1.name == "validate_scope")).environment == %{
              repair_provider: "codex"
            }

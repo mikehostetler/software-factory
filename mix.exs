@@ -31,7 +31,7 @@ defmodule Hancho.MixProject do
       {:jason, "~> 1.4"},
       {:jido_action, "~> 2.3"},
       {:jido_harness,
-       github: "agentjido/jido_harness", ref: "e41fc1651282469f2db4219a48d9f7feef1b0dbc"},
+       github: "agentjido/jido_harness", ref: "de86e30cd5b49f2f3e3444318f0a5124d35d02cb"},
       {:toml_elixir, "~> 3.1"},
       {:yaml_elixir, "~> 2.12"},
       {:zoi, "~> 0.18.7"}
