@@ -14,6 +14,11 @@ defmodule Hancho.Actions.Implement do
         model: Zoi.string() |> Zoi.min(1) |> Zoi.optional(),
         extra_args: Zoi.array(Zoi.string()) |> Zoi.default([]),
         reasoning_effort: Zoi.enum(["low", "medium", "high", "xhigh"]) |> Zoi.optional(),
+        sandbox_mode:
+          Zoi.enum(["default", "read_only", "workspace_write", "unrestricted"])
+          |> Zoi.optional(),
+        network_access: Zoi.boolean() |> Zoi.default(false),
+        network_hosts: Zoi.array(Zoi.string() |> Zoi.min(1)) |> Zoi.default([]),
         timeout_ms: Zoi.integer() |> Zoi.min(1),
         idle_timeout_ms: Zoi.integer() |> Zoi.min(1) |> Zoi.default(300_000),
         andon_warning_ms: Zoi.integer() |> Zoi.min(1) |> Zoi.default(120_000),
@@ -44,9 +49,11 @@ defmodule Hancho.Actions.Implement do
 
     with {:ok, provider} <- fetch_provider(params.provider),
          :ok <- validate_reasoning(provider, Map.get(params, :reasoning_effort)),
+         :ok <- validate_network_access(provider, Map.get(params, :network_access, false)),
+         :ok <- validate_network_hosts(provider, Map.get(params, :network_hosts, [])),
          {:ok, mix_paths} <- worktree_setup.prepare(params.worktree_path),
          {:ok, prior_run} <- prior_harness_run(context),
-         security = Hancho.ProviderSecurity.options(provider),
+         security = Hancho.ProviderSecurity.options(provider, Map.get(params, :network_hosts, [])),
          :ok <- audit_configuration(context, params, mix_paths, security),
          provider_started_at = System.monotonic_time(:millisecond),
          {:ok, result} <-
@@ -62,6 +69,8 @@ defmodule Hancho.Actions.Implement do
            ),
          :ok <- completed(result),
          provider_elapsed_ms = System.monotonic_time(:millisecond) - provider_started_at do
+      selected_sandbox = sandbox_mode(provider, Map.get(params, :sandbox_mode))
+
       {:ok,
        %{
          provider: params.provider,
@@ -71,6 +80,9 @@ defmodule Hancho.Actions.Implement do
          status: result.status,
          provider_elapsed_ms: provider_elapsed_ms,
          provider_elapsed_scope: "hancho_wait",
+         sandbox_mode: Atom.to_string(selected_sandbox),
+         network_access: Map.get(params, :network_access, false),
+         network_hosts: Map.get(params, :network_hosts, []),
          usage:
            Hancho.ProviderUsage.normalize(provider, result.usage) |> Hancho.ProviderUsage.to_map(),
          text: tail(result.text, 20_000),
@@ -98,7 +110,7 @@ defmodule Hancho.Actions.Implement do
 
     provider_options =
       security.provider_options
-      |> Map.merge(provider_options(params, reasoning_options))
+      |> Map.merge(provider_options(provider, params, reasoning_options))
 
     options =
       [
@@ -106,7 +118,7 @@ defmodule Hancho.Actions.Implement do
         model: Map.get(params, :model),
         env: mix_paths.env,
         approval_mode: approval_mode(provider),
-        sandbox_mode: :workspace_write,
+        sandbox_mode: sandbox_mode(provider, Map.get(params, :sandbox_mode)),
         runtime_timeout_ms: params.timeout_ms,
         idle_timeout_ms: min(params.idle_timeout_ms, params.timeout_ms),
         andon_warning_ms: params.andon_warning_ms,
@@ -134,12 +146,21 @@ defmodule Hancho.Actions.Implement do
     end
   end
 
-  # Grok's :auto_edit mode maps to acceptEdits, which can wait for interactive
-  # approval of shell and web tools. Hancho runs Grok without an approval
-  # responder, so use its non-interactive mode while the workspace sandbox
-  # continues to limit filesystem access.
-  defp approval_mode(:grok), do: :auto_approve
+  # Hancho has no interactive approval responder. Use an automatic mode only
+  # when the adapter can represent it. Amp and Kimi accept only the default.
+  defp approval_mode(provider) when provider in [:grok, :opencode, :pi], do: :auto_approve
+  defp approval_mode(provider) when provider in [:amp, :kimi], do: :default
   defp approval_mode(_provider), do: :auto_edit
+
+  # Some CLIs do not implement Harness workspace-write isolation. Their
+  # adapters reject that normalized value, so keep their provider default. All
+  # runs still use Hancho's isolated worktree.
+  defp sandbox_mode(provider, nil) when provider in [:amp, :kimi, :opencode, :pi], do: :default
+  defp sandbox_mode(_provider, nil), do: :workspace_write
+  defp sandbox_mode(_provider, "default"), do: :default
+  defp sandbox_mode(_provider, "read_only"), do: :read_only
+  defp sandbox_mode(_provider, "workspace_write"), do: :workspace_write
+  defp sandbox_mode(_provider, "unrestricted"), do: :unrestricted
 
   defp reasoning_options(provider, "xhigh") when provider in [:codex, :grok],
     do: [reasoning_effort: :xhigh]
@@ -156,11 +177,30 @@ defmodule Hancho.Actions.Implement do
 
   defp validate_reasoning(_provider, _effort), do: :ok
 
-  defp provider_options(params, reasoning_options) do
+  defp validate_network_access(:codex, true), do: :ok
+  defp validate_network_access(_provider, false), do: :ok
+
+  defp validate_network_access(provider, true) do
+    {:error,
+     "The #{provider} Harness adapter does not have a separate network-access control. " <>
+       "Select an adapter-supported sandbox_mode if the run must access a local server."}
+  end
+
+  defp validate_network_hosts(_provider, []), do: :ok
+
+  defp validate_network_hosts(provider, hosts)
+       when provider in [:claude, :zai] and is_list(hosts), do: :ok
+
+  defp validate_network_hosts(provider, _hosts) do
+    {:error, "The #{provider} Harness adapter does not support a sandbox network host allowlist."}
+  end
+
+  defp provider_options(provider, params, reasoning_options) do
     base =
       %{}
       |> maybe_put(:cli_path, Map.get(params, :cli))
       |> maybe_put(:extra_args, nonempty(Map.get(params, :extra_args)))
+      |> maybe_put(:network_access_enabled, network_access_option(provider, params))
 
     Map.merge(base, Keyword.get(reasoning_options, :provider_options, %{}))
   end
@@ -169,6 +209,8 @@ defmodule Hancho.Actions.Implement do
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
   defp nonempty([]), do: nil
   defp nonempty(value), do: value
+  defp network_access_option(:codex, params), do: Map.get(params, :network_access, false) || nil
+  defp network_access_option(_provider, _params), do: nil
 
   defp progress_callback(context, params) do
     fn progress ->
@@ -192,6 +234,12 @@ defmodule Hancho.Actions.Implement do
         provider: params.provider,
         model: Map.get(params, :model),
         model_source: model_source(params),
+        sandbox_mode:
+          Atom.to_string(
+            sandbox_mode(provider_atom(params.provider), Map.get(params, :sandbox_mode))
+          ),
+        network_access: Map.get(params, :network_access, false),
+        network_hosts: Map.get(params, :network_hosts, []),
         mix_paths: Map.drop(mix_paths, [:env]),
         credential_protection: security.evidence
       }
@@ -201,6 +249,8 @@ defmodule Hancho.Actions.Implement do
   defp model_source(params) do
     if is_binary(Map.get(params, :model)), do: "configured", else: "provider_default_unpinned"
   end
+
+  defp provider_atom(name), do: Map.fetch!(@providers, name)
 
   defp write_progress(context, %{phase: :andon} = progress) do
     {label, event} = andon_activity(context)

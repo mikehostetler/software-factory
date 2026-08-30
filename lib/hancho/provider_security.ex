@@ -19,8 +19,10 @@ defmodule Hancho.ProviderSecurity do
     "**/.env.*"
   ]
 
-  @spec options(atom()) :: map()
-  def options(:grok) do
+  @spec options(atom(), [String.t()]) :: map()
+  def options(provider, network_hosts \\ [])
+
+  def options(:grok, _network_hosts) do
     %{
       provider_options: %{deny_rules: permission_rules()},
       evidence: %{
@@ -31,20 +33,24 @@ defmodule Hancho.ProviderSecurity do
     }
   end
 
-  def options(provider) when provider in [:claude, :zai] do
-    settings = Jason.encode!(%{"permissions" => %{"deny" => permission_rules()}})
+  def options(provider, network_hosts) when provider in [:claude, :zai] do
+    settings =
+      %{"permissions" => %{"deny" => permission_rules()}}
+      |> put_network_hosts(network_hosts)
+      |> Jason.encode!()
 
     %{
       provider_options: %{settings: settings},
       evidence: %{
         profile: "claude_permission_rules",
         enforced: true,
-        rule_count: length(permission_rules())
+        rule_count: length(permission_rules()),
+        network_hosts: network_hosts
       }
     }
   end
 
-  def options(_provider) do
+  def options(_provider, _network_hosts) do
     %{
       provider_options: %{},
       evidence: %{
@@ -67,5 +73,11 @@ defmodule Hancho.ProviderSecurity do
     path
     |> String.trim_leading("**/")
     |> String.replace("**", "*")
+  end
+
+  defp put_network_hosts(settings, []), do: settings
+
+  defp put_network_hosts(settings, hosts) do
+    Map.put(settings, "sandbox", %{"network" => %{"allowedDomains" => hosts}})
   end
 end

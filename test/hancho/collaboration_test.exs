@@ -262,6 +262,85 @@ defmodule Hancho.CollaborationTest do
     assert Enum.any?(rules, &String.contains?(&1, ".aws/credentials"))
   end
 
+  test "uses approval and sandbox values supported by every Harness adapter" do
+    project = project()
+
+    expected = %{
+      amp: {:default, :default},
+      claude: {:auto_edit, :workspace_write},
+      codex: {:auto_edit, :workspace_write},
+      gemini: {:auto_edit, :workspace_write},
+      grok: {:auto_approve, :workspace_write},
+      kimi: {:default, :default},
+      opencode: {:auto_approve, :default},
+      pi: {:auto_approve, :default},
+      zai: {:auto_edit, :workspace_write}
+    }
+
+    Enum.each(expected, fn {provider, {approval_mode, sandbox_mode}} ->
+      assert {:ok, _result} =
+               Hancho.Actions.Implement.run(
+                 %{
+                   prompt: "Check the provider.",
+                   worktree_path: project.root,
+                   provider: Atom.to_string(provider),
+                   extra_args: [],
+                   timeout_ms: 1_000,
+                   idle_timeout_ms: 1_000,
+                   andon_warning_ms: 500,
+                   productive_warning_ms: 500,
+                   progress_interval_ms: 250
+                 },
+                 %{services: %{harness: RoleHarness}}
+               )
+
+      assert_receive {:harness_options, ^provider, "Check the provider.", options}
+      assert options[:approval_mode] == approval_mode
+      assert options[:sandbox_mode] == sandbox_mode
+    end)
+  end
+
+  test "passes explicit Codex network and Z.AI host controls to Harness" do
+    project = project()
+
+    base = %{
+      prompt: "Use the local fixture.",
+      worktree_path: project.root,
+      extra_args: [],
+      timeout_ms: 1_000,
+      idle_timeout_ms: 1_000,
+      andon_warning_ms: 500,
+      productive_warning_ms: 500,
+      progress_interval_ms: 250
+    }
+
+    assert {:ok, codex_result} =
+             Hancho.Actions.Implement.run(
+               Map.merge(base, %{provider: "codex", network_access: true}),
+               %{services: %{harness: RoleHarness}}
+             )
+
+    assert codex_result.network_access
+    assert codex_result.sandbox_mode == "workspace_write"
+    assert_receive {:harness_options, :codex, "Use the local fixture.", codex_options}
+    assert codex_options[:sandbox_mode] == :workspace_write
+    assert codex_options[:provider_options][:network_access_enabled]
+
+    assert {:ok, zai_result} =
+             Hancho.Actions.Implement.run(
+               Map.merge(base, %{provider: "zai", network_hosts: ["127.0.0.1"]}),
+               %{services: %{harness: RoleHarness}}
+             )
+
+    refute zai_result.network_access
+    assert zai_result.sandbox_mode == "workspace_write"
+    assert zai_result.network_hosts == ["127.0.0.1"]
+    assert_receive {:harness_options, :zai, "Use the local fixture.", zai_options}
+    assert zai_options[:sandbox_mode] == :workspace_write
+    settings = Jason.decode!(zai_options[:provider_options][:settings])
+    assert get_in(settings, ["sandbox", "network", "allowedDomains"]) == ["127.0.0.1"]
+  end
+
   test "attention action waits and then returns the durable answer" do
     context = %{
       run_id: "run-1",

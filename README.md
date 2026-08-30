@@ -139,6 +139,7 @@ steps:
     params:
       prompt: "$steps.render_prompt.rendered"
       worktree_path: "$steps.create_worktree.worktree_path"
+      network_access: true
       timeout_ms: 1800000
 ```
 
@@ -158,15 +159,29 @@ Jido.Harness does not report the effective model for all providers, so Hancho
 can always prove the requested model but cannot always prove provider fallback
 behavior.
 
-Hancho requests the Harness `workspace_write` sandbox for implementation. It
-also sends path deny rules for common credential stores to Grok, Claude, and
-Z.AI. The rules cover GitHub CLI hosts files, SSH private keys, cloud credential
-files, `.env` files, and similar stores. The pinned Jido.Harness adapters for
-Codex, Gemini, Amp, Kimi, OpenCode, and Pi do not expose a reliable file-read
-deny control. For those adapters, Hancho records `workspace_sandbox_only` as a
-limitation. Harness sandbox modes are provider requests, not a universal
-operating-system read sandbox. Do not make host credential stores available in
-an implementation workspace.
+Hancho requests the Harness `workspace_write` sandbox for adapters that support
+it. Amp, Kimi, OpenCode, and Pi use their adapter default because they cannot
+represent `workspace_write`. A step can set `sandbox_mode` to `default`,
+`read_only`, `workspace_write`, or `unrestricted`; the selected adapter must
+support the value. Use `unrestricted` only in a separately isolated workspace.
+
+Codex blocks network access in `workspace_write` mode by default. Set
+`network_access: true` only for a Codex step that must reach a trusted local
+server. This enables the Codex workspace network option; it does not limit
+connections to loopback. Claude and Z.AI steps can set `network_hosts` to a
+list of trusted hosts, such as `[127.0.0.1]`, while keeping the workspace
+sandbox. This requires the Jido.Harness Claude-settings merge fix. Other
+adapters do not expose a separate normalized network switch. For them, use an
+adapter-supported sandbox mode.
+
+Hancho also sends path deny rules for common credential stores to Grok, Claude,
+and Z.AI. The rules cover GitHub CLI hosts files, SSH private keys, cloud
+credential files, `.env` files, and similar stores. The pinned Jido.Harness
+adapters for Codex, Gemini, Amp, Kimi, OpenCode, and Pi do not expose a reliable
+file-read deny control. For those adapters, Hancho records
+`workspace_sandbox_only` as a limitation. Harness sandbox modes are provider
+requests, not a universal operating-system read sandbox. Do not make host
+credential stores available in an implementation workspace.
 
 When two adjacent steps have different roles, Hancho writes a durable handoff
 record before the first step completes. The record names the run, roles, steps,
