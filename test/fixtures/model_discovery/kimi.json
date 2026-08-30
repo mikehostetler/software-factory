@@ -1,0 +1,15 @@
+{
+  "providers": [
+    {
+      "id": "moonshot",
+      "models": [
+        {"id": "kimi-k2-test"},
+        {"id": "kimi-k2-fast"}
+      ],
+      "apiKey": "fixture-secret-must-not-appear"
+    }
+  ],
+  "modelAliases": {
+    "kimi-default": {"model": "kimi-k2-test"}
+  }
+}
