@@ -199,70 +199,70 @@ defmodule Hancho.Harness do
         end
 
       {:error, :timeout} ->
-        if expired?(deadline) do
-          {:error, :timeout}
-        else
-          {next_cursor, latest, events} = replay(run_id, cursor, latest)
-          now = now()
+        {next_cursor, latest, events} = replay(run_id, cursor, latest)
+        now = now()
 
-          {last_activity_at, andon_warned?} =
-            activity_state(events, now, last_activity_at, andon_warned?)
+        {last_activity_at, andon_warned?} =
+          activity_state(events, now, last_activity_at, andon_warned?)
 
-          {last_productive_at, productive_warned?, productive_event_count, last_productive} =
-            productivity_state(
-              events,
-              now,
-              last_productive_at,
-              productive_warned?,
-              productive_event_count,
-              last_productive
-            )
+        {last_productive_at, productive_warned?, productive_event_count, last_productive} =
+          productivity_state(
+            events,
+            now,
+            last_productive_at,
+            productive_warned?,
+            productive_event_count,
+            last_productive
+          )
 
-          warn? =
-            not andon_warned? and now - last_activity_at >= andon_warning_ms
+        warn? =
+          not andon_warned? and now - last_activity_at >= andon_warning_ms
 
-          productive_warn? =
-            not productive_warned? and
-              now - last_productive_at >= productive_warning_ms
+        productive_warn? =
+          not productive_warned? and
+            now - last_productive_at >= productive_warning_ms
 
-          with :ok <- notify_events(event_callback, events),
-               :ok <-
-                 maybe_notify_andon(
-                   callback,
-                   warn?,
-                   run_id,
-                   provider,
-                   started_at,
-                   next_cursor,
-                   latest,
-                   now - last_activity_at,
-                   andon_warning_ms
-                 ),
-               :ok <-
-                 maybe_notify_productivity_andon(
-                   callback,
-                   productive_warn?,
-                   run_id,
-                   provider,
-                   started_at,
-                   next_cursor,
-                   latest,
-                   now - last_productive_at,
-                   productive_warning_ms,
-                   productive_event_count,
-                   last_productive
-                 ),
-               :ok <-
-                 maybe_notify_progress(
-                   callback,
-                   now,
-                   next_progress_at,
-                   run_id,
-                   provider,
-                   started_at,
-                   next_cursor,
-                   latest
-                 ) do
+        with :ok <- notify_events(event_callback, events),
+             :ok <-
+               maybe_notify_andon(
+                 callback,
+                 warn?,
+                 run_id,
+                 provider,
+                 started_at,
+                 next_cursor,
+                 latest,
+                 now - last_activity_at,
+                 andon_warning_ms
+               ),
+             :ok <-
+               maybe_notify_productivity_andon(
+                 callback,
+                 productive_warn?,
+                 run_id,
+                 provider,
+                 started_at,
+                 next_cursor,
+                 latest,
+                 now - last_productive_at,
+                 productive_warning_ms,
+                 productive_event_count,
+                 last_productive
+               ),
+             :ok <-
+               maybe_notify_progress(
+                 callback,
+                 now,
+                 next_progress_at,
+                 run_id,
+                 provider,
+                 started_at,
+                 next_cursor,
+                 latest
+               ) do
+          if expired?(deadline) do
+            {:error, :timeout}
+          else
             await_next(
               run_id,
               provider,
@@ -340,11 +340,14 @@ defmodule Hancho.Harness do
     end
   end
 
-  defp activity_state([], _now, last_activity_at, andon_warned?),
-    do: {last_activity_at, andon_warned?}
+  defp activity_state(events, now, last_activity_at, andon_warned?) do
+    if Enum.any?(events, &provider_activity?/1),
+      do: {now, false},
+      else: {last_activity_at, andon_warned?}
+  end
 
-  defp activity_state(_events, now, _last_activity_at, _andon_warned?),
-    do: {now, false}
+  defp provider_activity?(%{type: type}) when type in [:run_started, :run_completed], do: false
+  defp provider_activity?(_event), do: true
 
   defp productivity_state(
          events,

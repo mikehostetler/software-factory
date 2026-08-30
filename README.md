@@ -151,6 +151,52 @@ provider must support the requested model, reasoning effort, and extra
 arguments. `xhigh` is supported for Codex and Grok through the normalized
 Harness reasoning option.
 
+#### CLI provider contract
+
+Hancho supports Amp, Claude Code, Codex, Gemini CLI, Grok, Kimi Code,
+OpenCode, Pi, and Z.AI. Provider discovery, an explicit `cli` executable,
+authentication reporting, the normalized streaming envelope, the Hancho wait
+timeout, retained-run reattachment, and normalized Harness errors are
+guaranteed for all nine providers. Authentication is reported as `true`,
+`false`, or `unknown`. An `unknown` value does not prove that a provider is
+authenticated.
+
+The table records provider-specific and unavailable behavior in the pinned
+Jido.Harness version. "Resume" means provider-owned session resume. Hancho can
+reattach to a retained Harness run for every provider. "Native" cancellation
+uses an adapter cancellation function. "Managed" cancellation stops the
+supervised Harness run without a provider-specific cancellation function.
+
+| Provider | Model | Reasoning effort | Tool events | Resume | Cancellation | Usage report |
+| --- | --- | --- | --- | --- | --- | --- |
+| Amp | Unavailable | `low`, `medium`, `high`; selects the thinking stream but does not pin a distinct model effort | Provider-specific | Provider-specific | Native | Run-scoped, additive |
+| Claude Code | Provider-specific | `low`, `medium`, `high` | Provider-specific | Provider-specific | Native | Run-scoped, additive |
+| Codex | Provider-specific | `low`, `medium`, `high`, `xhigh` | Provider-specific | Provider-specific | Native | Run-scoped, additive |
+| Gemini CLI | Provider-specific | Unavailable | Provider-specific | Provider-specific | Native | Run-scoped, additive |
+| Grok | Provider-specific | `low`, `medium`, `high`, `xhigh` | Provider-specific | Provider-specific | Native | Provider-cumulative, not additive |
+| Kimi Code | Provider-specific | `low`, `medium`, `high` | Provider-specific | Provider-specific | Native | Unavailable |
+| OpenCode | Provider-specific | `low`, `medium`, `high` | Unavailable in the finite-run adapter contract | Unavailable in the finite-run adapter contract | Native | Unavailable |
+| Pi | Provider-specific | `low`, `medium`, `high` | Provider-specific | Provider-specific | Native | Provider-reported scope is unknown; not additive |
+| Z.AI | Provider-specific | `low`, `medium`, `high` | Provider-specific | Provider-specific | Managed; native adapter cancellation is unavailable | Run-scoped, additive |
+
+Streaming always includes ordered Harness run events. Text events are
+guaranteed. Thinking, tool-call, tool-result, file-change, and usage events are
+present only when the provider adapter declares and emits them. A timeout or a
+provider failure produces a terminal result with a normalized category,
+provider name, Harness run ID, and cause when one is available.
+
+Hancho validates model, reasoning, extra-argument, and sandbox selections
+before it prepares the workspace. This prevents a provider-specific option
+error from starting implementation work. Gemini read-only runs use prompt
+approval because Gemini does not permit automatic approval in read-only mode.
+
+The provider contract tests use deterministic fixture adapters. They do not
+need installed provider CLIs or live credentials. The fixtures cover ordered
+streaming events, tool calls, cancellation, runtime timeout, retained-run
+resume, usage, authentication state, and error normalization for every
+supported provider. The tests also compare the recorded capability matrix with
+the pinned built-in adapter specifications.
+
 Set `model` to pin a provider model. Hancho sends that exact configured value
 to Harness and records it in dry-run output, provider progress, and the durable
 implementation result. When `model` is absent, Hancho reports `provider default;
