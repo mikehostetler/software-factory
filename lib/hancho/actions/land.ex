@@ -68,7 +68,11 @@ defmodule Hancho.Actions.Land do
          {:ok, head} <- git.head(working_dir: params.repo_path),
          :ok <- same_baseline(head, params.baseline),
          {:ok, _result} <- git.merge_ff_only(params.repo_path, params.commit),
-         {:ok, landed} <- git.head(working_dir: params.repo_path) do
+         {:ok, final_status} <- git.status(working_dir: params.repo_path),
+         :ok <- expected_branch(final_status, params.branch),
+         :ok <- clean(final_status),
+         {:ok, landed} <- git.head(working_dir: params.repo_path),
+         :ok <- exact_commit(landed, params.commit) do
       {:ok, %{commit: landed, branch: params.branch}}
     end
   end
@@ -78,6 +82,18 @@ defmodule Hancho.Actions.Land do
 
   defp same_baseline(head, head), do: :ok
   defp same_baseline(_head, _baseline), do: {:error, "The landing branch changed during the run."}
+
+  defp exact_commit(commit, commit), do: :ok
+
+  defp exact_commit(actual, expected),
+    do:
+      {:error,
+       %{
+         code: "filesystem_out_of_sync",
+         field: "landing_head",
+         expected: expected,
+         actual: actual
+       }}
 
   defp expected_branch(%Git.Status{branch: branch}, branch), do: :ok
 

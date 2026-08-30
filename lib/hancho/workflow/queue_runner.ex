@@ -5,12 +5,15 @@ defmodule Hancho.Workflow.QueueRunner do
   alias Hancho.Forensics
 
   alias Hancho.Workflow.{
+    Artifacts,
     Compiler,
+    Definition,
     IssueSelector,
     Loader,
     QueuePlan,
     QueueReconciler,
     QueueReporter,
+    Result,
     Runner,
     Store
   }
@@ -188,14 +191,49 @@ defmodule Hancho.Workflow.QueueRunner do
 
   defp resume_with_store(project, queue_id, store, options) do
     store_api = Keyword.get(options, :store_api, Store)
-    runner = Keyword.get(options, :workflow_runner, Runner)
 
     with {:ok, queue} <- store_api.fetch_queue(store, queue_id),
-         :ok <- resumable_queue(queue),
-         items = QueuePlan.from_state(queue),
-         position = queue["current_position"],
-         item = Enum.at(items, position),
-         {:ok, recovery} <- child_recovery(store_api, store, item.run_id),
+         {:ok, recovery} <- resumable_queue(queue) do
+      resume_recovery(project, queue_id, queue, recovery, store, options)
+    end
+  end
+
+  defp resume_recovery(project, queue_id, queue, :finalize, store, options) do
+    store_api = Keyword.get(options, :store_api, Store)
+    items = QueuePlan.from_state(queue)
+
+    with :ok <- store_api.resume_queue(store, queue_id),
+         :ok <- store_api.flush(store),
+         :ok <-
+           QueueReporter.emit(
+             project,
+             queue_id,
+             "queue.resumed",
+             "Queue #{queue_id} resumed after its final saved child.",
+             %{recovery: :finalize, completed_count: length(items)},
+             true,
+             options
+           ) do
+      run_items(
+        project,
+        queue["workflow_name"],
+        queue_id,
+        items,
+        length(items),
+        store,
+        options
+      )
+    end
+  end
+
+  defp resume_recovery(project, queue_id, queue, :child, store, options) do
+    store_api = Keyword.get(options, :store_api, Store)
+    runner = Keyword.get(options, :workflow_runner, Runner)
+    items = QueuePlan.from_state(queue)
+    position = queue["current_position"]
+    item = Enum.at(items, position)
+
+    with {:ok, recovery} <- child_recovery(store_api, store, item.run_id),
          :ok <- store_api.resume_queue(store, queue_id),
          :ok <- store_api.flush(store),
          :ok <-
@@ -215,7 +253,7 @@ defmodule Hancho.Workflow.QueueRunner do
              recovery_event(recovery),
              QueueReporter.item_message(recovery_verb(recovery), item, position, length(items)),
              QueueReporter.item_metadata(item, position, length(items))
-             |> Map.put(:recovery, recovery),
+             |> Map.put(:recovery, recovery_label(recovery)),
              true,
              options
            ) do
@@ -595,9 +633,18 @@ defmodule Hancho.Workflow.QueueRunner do
 
   defp resumable_queue(%{"status" => status, "items" => items, "current_position" => position})
        when status in ["stopped", "running", "recovery_required"] do
-    case Enum.at(items, position) do
-      %{"status" => item_status} when item_status in ["pending", "stopped", "running"] -> :ok
-      _item -> {:error, :resumable_queue_item_not_found}
+    cond do
+      position == length(items) and Enum.all?(items, &(&1["status"] == "completed")) ->
+        {:ok, :finalize}
+
+      match?(
+        %{"status" => item_status} when item_status in ["pending", "stopped", "running"],
+        Enum.at(items, position)
+      ) ->
+        {:ok, :child}
+
+      true ->
+        {:error, :resumable_queue_item_not_found}
     end
   end
 
@@ -606,6 +653,7 @@ defmodule Hancho.Workflow.QueueRunner do
   defp child_recovery(store_api, store, run_id) do
     if function_exported?(store_api, :fetch_run, 2) do
       case store_api.fetch_run(store, run_id) do
+        {:ok, %{"status" => "completed"} = run} -> {:ok, {:completed, run}}
         {:ok, _run} -> {:ok, :retry}
         {:error, :not_found} -> {:ok, :start}
         {:error, reason} -> {:error, {:child_state_unavailable, reason}}
@@ -619,6 +667,24 @@ defmodule Hancho.Workflow.QueueRunner do
     runner.retry(project, item.run_id, options)
   end
 
+  defp recover_child(_runner, {:completed, run}, _project, _workflow, _item, _options) do
+    with {:ok, outputs} <- Jason.decode(run["outputs_json"]),
+         {:ok, values} <- YamlElixir.read_from_string(run["workflow_yaml"]),
+         {:ok, definition} <- Definition.new(values),
+         {:ok, result} <-
+           Result.new(%{
+             run_id: run["id"],
+             workflow: run["workflow_name"],
+             status: :completed,
+             current_step: nil,
+             outputs: outputs,
+             artifacts: Artifacts.from_outputs(definition, outputs),
+             error: nil
+           }) do
+      {:ok, result}
+    end
+  end
+
   defp recover_child(runner, :start, project, workflow, item, options) do
     runner.run(
       project,
@@ -630,8 +696,12 @@ defmodule Hancho.Workflow.QueueRunner do
 
   defp recovery_event(:retry), do: "queue.item_retried"
   defp recovery_event(:start), do: "queue.item_restarted"
+  defp recovery_event({:completed, _run}), do: "queue.item_recovered"
   defp recovery_verb(:retry), do: "Retrying"
   defp recovery_verb(:start), do: "Restarting"
+  defp recovery_verb({:completed, _run}), do: "Recovering completed"
+  defp recovery_label({:completed, _run}), do: :completed
+  defp recovery_label(recovery), do: recovery
 
   defp reconcile_stopped(reconciler, project, queue, artifacts, options) do
     if function_exported?(reconciler, :after_stopped_run, 4) do

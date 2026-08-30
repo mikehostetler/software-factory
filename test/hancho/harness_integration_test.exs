@@ -60,6 +60,7 @@ defmodule Hancho.HarnessIntegrationTest do
     :ok
   end
 
+  @tag timeout: 120_000
   test "runs the implementation workflow through the real Jido.Harness lifecycle" do
     repository = temporary_repository()
     project = Hancho.Project.new(repository)

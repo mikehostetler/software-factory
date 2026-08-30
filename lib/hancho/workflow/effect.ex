@@ -16,7 +16,8 @@ defmodule Hancho.Workflow.Effect do
   defp run_durable(effect_store, key, kind, intent, reconcile, apply) do
     %{api: api, store: store, run_id: run_id, step_position: position} = effect_store
 
-    with {:ok, record} <- api.begin_effect(store, run_id, position, key, kind, intent) do
+    with {:ok, record} <- api.begin_effect(store, run_id, position, key, kind, intent),
+         :ok <- durable(api, store, key) do
       case record["status"] do
         "applied" -> decode_receipt(record)
         "intended" -> reconcile_or_apply(api, store, run_id, position, key, reconcile, apply)
@@ -61,6 +62,17 @@ defmodule Hancho.Workflow.Effect do
       {:ok, decoded} when is_map(decoded) -> {:ok, decoded}
       {:ok, decoded} -> {:error, {:invalid_effect_receipt, decoded}}
       {:error, reason} -> {:error, {:invalid_effect_receipt, Exception.message(reason)}}
+    end
+  end
+
+  defp durable(api, store, key) do
+    if function_exported?(api, :flush, 1) do
+      case api.flush(store) do
+        :ok -> :ok
+        {:error, reason} -> {:error, {:effect_intent_flush_failed, key, reason}}
+      end
+    else
+      :ok
     end
   end
 end

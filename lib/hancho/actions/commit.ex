@@ -38,12 +38,13 @@ defmodule Hancho.Actions.Commit do
   end
 
   defp reconcile(git, worktree, baseline, issue_id) do
-    with {:ok, head} <- git.head(working_dir: worktree) do
+    with {:ok, status} <- git.status(working_dir: worktree),
+         :ok <- detached(status),
+         {:ok, head} <- git.head(working_dir: worktree) do
       if head == baseline do
         :not_applied
       else
-        with {:ok, status} <- git.status(working_dir: worktree),
-             :ok <- clean(status),
+        with :ok <- clean(status),
              {:ok, shown} <- git.show(head, working_dir: worktree),
              :ok <- expected_commit(shown, issue_id) do
           {:ok, %{commit: head, issue_id: issue_id}}
@@ -53,9 +54,10 @@ defmodule Hancho.Actions.Commit do
   end
 
   defp commit(git, worktree, baseline, issue_id, message) do
-    with {:ok, head} <- git.head(working_dir: worktree),
+    with {:ok, status} <- git.status(working_dir: worktree),
+         :ok <- detached(status),
+         {:ok, head} <- git.head(working_dir: worktree),
          :ok <- unchanged_head(head, baseline),
-         {:ok, status} <- git.status(working_dir: worktree),
          :ok <- has_changes(status),
          {:ok, :done} <- git.add_all(worktree),
          {:ok, commit} <- git.commit(worktree, message) do
@@ -65,6 +67,18 @@ defmodule Hancho.Actions.Commit do
 
   defp clean(%Git.Status{entries: []}), do: :ok
   defp clean(_status), do: {:error, "The recovered commit worktree has new changes."}
+
+  defp detached(%Git.Status{branch: branch}) when branch in [nil, "HEAD (no branch)"], do: :ok
+
+  defp detached(%Git.Status{branch: branch}) do
+    {:error,
+     %{
+       code: "filesystem_out_of_sync",
+       field: "worktree_branch",
+       expected: "detached HEAD",
+       actual: branch
+     }}
+  end
 
   defp expected_commit(%Git.ShowResult{commit: commit}, issue_id) when not is_nil(commit) do
     contents = commit.subject <> "\n" <> commit.body

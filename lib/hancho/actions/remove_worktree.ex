@@ -29,7 +29,7 @@ defmodule Hancho.Actions.RemoveWorktree do
           "remove",
           "git.worktree.remove",
           %{repository: params.repo_path, path: path},
-          fn -> if(File.exists?(path), do: :not_applied, else: {:ok, receipt}) end,
+          fn -> reconcile(git, params.repo_path, path, receipt) end,
           fn -> remove(git, params.repo_path, path, receipt) end
         )
 
@@ -39,9 +39,47 @@ defmodule Hancho.Actions.RemoveWorktree do
   end
 
   defp remove(git, repository, path, receipt) do
-    case git.remove_worktree(repository, path) do
-      {:ok, :done} -> {:ok, receipt}
-      {:error, reason} -> {:error, reason}
+    with {:ok, :done} <- git.remove_worktree(repository, path),
+         {:ok, ^receipt} <- reconcile(git, repository, path, receipt) do
+      {:ok, receipt}
+    end
+  end
+
+  defp reconcile(git, repository, path, receipt) do
+    if File.exists?(path) do
+      :not_applied
+    else
+      with {:ok, registrations} <- git.worktrees(working_dir: repository) do
+        if Enum.any?(registrations, &same_path?(&1.path, path)) do
+          {:error,
+           %{
+             code: "filesystem_out_of_sync",
+             field: "worktree_registration",
+             expected: nil,
+             actual: path,
+             path: path
+           }}
+        else
+          {:ok, receipt}
+        end
+      end
+    end
+  end
+
+  defp same_path?(left, right) do
+    Path.expand(left) == Path.expand(right) or same_file?(left, right) or
+      (Path.basename(left) == Path.basename(right) and
+         same_file?(Path.dirname(left), Path.dirname(right)))
+  end
+
+  defp same_file?(left, right) do
+    with {:ok, left_stat} <- File.stat(left),
+         {:ok, right_stat} <- File.stat(right) do
+      left_stat.inode == right_stat.inode and
+        left_stat.major_device == right_stat.major_device and
+        left_stat.minor_device == right_stat.minor_device
+    else
+      _error -> false
     end
   end
 end

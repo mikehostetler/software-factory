@@ -507,12 +507,19 @@ defmodule Hancho.CLI do
     IO.puts("Retained worktree: #{report.retained_worktree || "none"}")
     IO.puts("Forensic report: #{report.forensic_report || "none"}")
     if report.failure, do: IO.puts("Failure: #{format_error(report.failure)}")
+    print_effects(Map.get(report, :effects, []))
     IO.puts("Steps:")
 
     Enum.each(report.steps, fn step ->
       IO.puts(
         "#{step.position + 1}. #{step.name}: #{step.status} (#{format_duration(step.duration_ms)})"
       )
+
+      if operation = Map.get(step, :operation) do
+        history_count = length(Map.get(operation, "history", []))
+
+        IO.puts("   Operation: #{operation["kind"]} #{operation["id"]} (#{history_count} prior)")
+      end
 
       Enum.each(Map.get(step, :repairs, []), fn repair ->
         provider = repair["provider"] || "unknown provider"
@@ -522,6 +529,19 @@ defmodule Hancho.CLI do
     end)
 
     0
+  end
+
+  defp print_effects([]), do: IO.puts("Effects: none")
+
+  defp print_effects(effects) do
+    IO.puts("Effects:")
+
+    Enum.each(effects, fn effect ->
+      IO.puts(
+        "- Step #{effect["step_position"] + 1}: #{effect["kind"]} #{effect["status"]} " <>
+          "(attempt #{effect["attempt"]})"
+      )
+    end)
   end
 
   defp print_worktree_list([]) do

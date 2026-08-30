@@ -245,6 +245,59 @@ defmodule Hancho.Workflow.Store do
     end)
   end
 
+  @spec mark_recovery_required(String.t(), String.t(), non_neg_integer(), String.t(), term()) ::
+          :ok | {:error, term()}
+  def mark_recovery_required(store, run_id, position, step_name, error) do
+    update_run_and_step(store, run_id, position, fn run, step ->
+      with :ok <-
+             status_in(
+               run,
+               ["running", "stopped", "recovery_required"],
+               :run_not_recoverable
+             ),
+           :ok <-
+             status_in(
+               step,
+               ["running", "stopped", "recovery_required"],
+               :step_not_recoverable
+             ) do
+        required_step =
+          step
+          |> Map.put("status", "recovery_required")
+          |> Map.put("error_json", encode!(error))
+          |> Map.put("finished_at", now())
+
+        required_run =
+          run
+          |> Map.put("status", "recovery_required")
+          |> Map.put("current_step", step_name)
+          |> Map.put("error_json", encode!(error))
+          |> Map.put("finished_at", now())
+
+        {required_run, required_step}
+      end
+    end)
+  end
+
+  @spec mark_run_recovery_required(String.t(), String.t(), String.t() | nil, term()) ::
+          :ok | {:error, term()}
+  def mark_run_recovery_required(store, run_id, step_name, error) do
+    update_run(store, run_id, fn run ->
+      with :ok <-
+             status_in(
+               run,
+               ["running", "stopped", "recovery_required"],
+               :run_not_recoverable
+             ) do
+        run
+        |> Map.put("status", "recovery_required")
+        |> Map.put("current_step", step_name)
+        |> Map.put("error_json", encode!(error))
+        |> Map.put("finished_at", now())
+      end
+    end)
+  end
+
   @spec fetch_run(String.t(), String.t()) :: {:ok, map()} | {:error, term()}
   def fetch_run(store, id) do
     transact(store, fn ->
@@ -383,6 +436,26 @@ defmodule Hancho.Workflow.Store do
     end)
   end
 
+  @spec list_effects(String.t(), String.t()) :: {:ok, [map()]} | {:error, term()}
+  def list_effects(store, run_id) do
+    transact(store, fn ->
+      if Repo.get(run_key(run_id)) do
+        prefix = effect_prefix(run_id)
+
+        prefix
+        |> Elixir.Bedrock.KeyRange.from_prefix()
+        |> Repo.get_range()
+        |> RecordRange.decode_prefix(prefix, &decode_record(&1, EffectRecord))
+        |> case do
+          {:ok, effects} -> {:ok, Enum.sort_by(effects, &{&1["step_position"], &1["key"]})}
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      else
+        Repo.rollback(:not_found)
+      end
+    end)
+  end
+
   @spec record_step_operation(
           String.t(),
           String.t(),
@@ -394,8 +467,9 @@ defmodule Hancho.Workflow.Store do
   def record_step_operation(store, run_id, position, kind, id, metadata) do
     update_run_and_step(store, run_id, position, fn run, step ->
       with :ok <- status_in(run, ["running"], :run_not_running),
-           :ok <- status_in(step, ["running"], :step_not_running) do
-        operation = encode!(%{kind: kind, id: id, metadata: metadata})
+           :ok <- status_in(step, ["running"], :step_not_running),
+           {:ok, previous} <- decode_optional(step["operation_json"]),
+           {:ok, operation} <- next_operation(previous, kind, id, metadata) do
         {run, Map.put(step, "operation_json", operation)}
       end
     end)
@@ -581,24 +655,45 @@ defmodule Hancho.Workflow.Store do
            {:ok, queue} <- get_queue(queue_key(queue_id)),
            :ok <-
              status_in(queue, ["stopped", "running", "recovery_required"], :queue_not_resumable),
-           position = queue["current_position"],
-           {:ok, item} <- queue_item(queue, position),
-           :ok <- status_in(item, ["pending", "stopped", "running"], :queue_item_not_resumable) do
-        resumed_item =
-          item
-          |> Map.put("status", "running")
-          |> Map.put("error", nil)
+           position = queue["current_position"] do
+        if position == length(queue["items"]) and
+             Enum.all?(queue["items"], &(&1["status"] == "completed")) do
+          resumed_queue =
+            queue
+            |> Map.put("status", "running")
+            |> Map.put("current_run_id", nil)
+            |> Map.put("finished_at", nil)
+            |> Map.put("error", nil)
 
-        resumed_queue =
-          queue
-          |> put_queue_item(position, resumed_item)
-          |> Map.put("status", "running")
-          |> Map.put("current_run_id", item["run_id"])
-          |> Map.put("finished_at", nil)
-          |> Map.put("error", nil)
+          put_queue(queue_key(queue_id), bump(resumed_queue))
+          Repo.put(@active_queue_key, queue_id)
+        else
+          with {:ok, item} <- queue_item(queue, position),
+               :ok <-
+                 status_in(
+                   item,
+                   ["pending", "stopped", "running"],
+                   :queue_item_not_resumable
+                 ) do
+            resumed_item =
+              item
+              |> Map.put("status", "running")
+              |> Map.put("error", nil)
 
-        put_queue(queue_key(queue_id), bump(resumed_queue))
-        Repo.put(@active_queue_key, queue_id)
+            resumed_queue =
+              queue
+              |> put_queue_item(position, resumed_item)
+              |> Map.put("status", "running")
+              |> Map.put("current_run_id", item["run_id"])
+              |> Map.put("finished_at", nil)
+              |> Map.put("error", nil)
+
+            put_queue(queue_key(queue_id), bump(resumed_queue))
+            Repo.put(@active_queue_key, queue_id)
+          else
+            {:error, reason} -> Repo.rollback(reason)
+          end
+        end
       else
         {:error, reason} -> Repo.rollback(reason)
       end
@@ -888,6 +983,34 @@ defmodule Hancho.Workflow.Store do
     end)
   end
 
+  defp next_operation(nil, kind, id, metadata) do
+    {:ok, encode!(%{kind: kind, id: id, metadata: metadata, history: []})}
+  end
+
+  defp next_operation(%{"kind" => kind, "id" => id} = current, kind, id, metadata) do
+    history = Map.get(current, "history", [])
+    {:ok, encode!(%{kind: kind, id: id, metadata: metadata, history: history})}
+  end
+
+  defp next_operation(%{"kind" => kind} = current, kind, id, metadata) do
+    history = Map.get(current, "history", [])
+    prior = Map.drop(current, ["history"])
+
+    {:ok,
+     encode!(%{
+       kind: kind,
+       id: id,
+       metadata: metadata,
+       history: Enum.take(history ++ [prior], -20)
+     })}
+  end
+
+  defp next_operation(%{"kind" => other}, kind, _id, _metadata),
+    do: {:error, {:operation_kind_changed, other, kind}}
+
+  defp next_operation(other, _kind, _id, _metadata),
+    do: {:error, {:invalid_step_operation, other}}
+
   defp next_repair_attempt(repairs, attempt) do
     if attempt == length(repairs) + 1,
       do: :ok,
@@ -996,15 +1119,14 @@ defmodule Hancho.Workflow.Store do
   defp run_key(run_id), do: @prefix <> encoded_id(run_id) <> "/run"
   defp queue_key(queue_id), do: @queue_prefix <> encoded_id(queue_id) <> "/queue"
   defp step_prefix(run_id), do: @prefix <> encoded_id(run_id) <> "/steps/"
+  defp effect_prefix(run_id), do: @prefix <> encoded_id(run_id) <> "/effects/"
 
   defp step_key(run_id, position) do
     step_prefix(run_id) <> String.pad_leading(Integer.to_string(position), 12, "0")
   end
 
   defp effect_key(run_id, position, key) do
-    @prefix <>
-      encoded_id(run_id) <>
-      "/effects/" <>
+    effect_prefix(run_id) <>
       String.pad_leading(Integer.to_string(position), 12, "0") <>
       "/" <> encoded_id(key)
   end

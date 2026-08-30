@@ -6,6 +6,8 @@ defmodule Hancho.Harness do
   @default_productive_warning_ms 120_000
   @default_event_poll_interval_ms 500
   @default_cancellation_timeout_ms 30_000
+  @stream_replay_page_size 10_000
+  @stream_replay_limit 100_000
 
   def ensure_started do
     with :ok <- Hancho.Command.Runtime.ensure_started(),
@@ -189,14 +191,17 @@ defmodule Hancho.Harness do
       {:ok, result} ->
         {next_cursor, latest, events} = replay(run_id, cursor, latest)
 
-        with :ok <- notify_events(event_callback, events),
-             :ok <-
-               notify(
-                 callback,
-                 progress(run_id, provider, :completed, elapsed(started_at), next_cursor, latest)
-               ) do
-          {:ok, result}
-        end
+        finish_await(
+          run_id,
+          provider,
+          started_at,
+          next_cursor,
+          latest,
+          events,
+          result,
+          callback,
+          event_callback
+        )
 
       {:error, :timeout} ->
         if expired?(deadline) do
@@ -340,11 +345,20 @@ defmodule Hancho.Harness do
     end
   end
 
-  defp activity_state([], _now, last_activity_at, andon_warned?),
-    do: {last_activity_at, andon_warned?}
+  defp activity_state(events, now, last_activity_at, andon_warned?) do
+    if Enum.any?(events, &activity_event?/1),
+      do: {now, false},
+      else: {last_activity_at, andon_warned?}
+  end
 
-  defp activity_state(_events, now, _last_activity_at, _andon_warned?),
-    do: {now, false}
+  defp activity_event?(%{type: :provider_event}), do: false
+  defp activity_event?(%{type: :usage}), do: false
+
+  defp activity_event?(%{type: type}) when type in [:run_started, :run_completed, :run_failed],
+    do: false
+
+  defp activity_event?(%{type: :run_cancelled}), do: false
+  defp activity_event?(_event), do: true
 
   defp productivity_state(
          events,
@@ -523,6 +537,262 @@ defmodule Hancho.Harness do
   rescue
     error -> {:error, {:event_callback_failed, {:exception, error}}}
   end
+
+  defp finish_await(
+         run_id,
+         provider,
+         started_at,
+         cursor,
+         latest,
+         events,
+         result,
+         callback,
+         event_callback
+       ) do
+    case stream_issues(run_id) do
+      {:ok, []} ->
+        notify_terminal(
+          run_id,
+          provider,
+          started_at,
+          cursor,
+          latest,
+          events,
+          result,
+          callback,
+          event_callback,
+          []
+        )
+
+      {:ok, issues} when result.status == :completed ->
+        stream_andon(
+          run_id,
+          provider,
+          started_at,
+          cursor,
+          latest,
+          events,
+          result,
+          issues,
+          callback,
+          event_callback
+        )
+
+      {:ok, issues} ->
+        notify_terminal(
+          run_id,
+          provider,
+          started_at,
+          cursor,
+          latest,
+          events,
+          result,
+          callback,
+          event_callback,
+          issues
+        )
+
+      {:error, reason} when result.status == :completed ->
+        stream_andon(
+          run_id,
+          provider,
+          started_at,
+          cursor,
+          latest,
+          events,
+          result,
+          [%{code: "event_replay_failed", error: normalize(reason)}],
+          callback,
+          event_callback
+        )
+
+      {:error, reason} ->
+        notify_terminal(
+          run_id,
+          provider,
+          started_at,
+          cursor,
+          latest,
+          events,
+          result,
+          callback,
+          event_callback,
+          [%{code: "event_replay_failed", error: normalize(reason)}]
+        )
+    end
+  end
+
+  defp notify_terminal(
+         run_id,
+         provider,
+         started_at,
+         cursor,
+         latest,
+         events,
+         result,
+         callback,
+         event_callback,
+         issues
+       ) do
+    details =
+      %{
+        terminal_status: result.status,
+        error: normalize(result.error)
+      }
+      |> maybe_put(:stream_issues, issues)
+
+    terminal =
+      run_id
+      |> progress(provider, terminal_phase(result.status), elapsed(started_at), cursor, latest)
+      |> Map.merge(details)
+
+    with :ok <- notify_events(event_callback, events),
+         :ok <- notify(callback, terminal) do
+      {:ok, result}
+    end
+  end
+
+  defp stream_andon(
+         run_id,
+         provider,
+         started_at,
+         cursor,
+         latest,
+         events,
+         result,
+         issues,
+         callback,
+         event_callback
+       ) do
+    error = %{
+      code: "harness_stream_invalid",
+      harness_run_id: run_id,
+      terminal_status: result.status,
+      issues: issues
+    }
+
+    progress =
+      run_id
+      |> progress(provider, :stream_andon, elapsed(started_at), cursor, latest)
+      |> Map.merge(error)
+
+    with :ok <- notify_events(event_callback, events),
+         :ok <- notify(callback, progress) do
+      {:error, error}
+    end
+  end
+
+  defp terminal_phase(:completed), do: :completed
+  defp terminal_phase(:failed), do: :failed
+  defp terminal_phase(:cancelled), do: :cancelled
+
+  defp stream_issues(run_id) do
+    with {:ok, events} <- replay_all(run_id, 0, @stream_replay_limit, []) do
+      {:ok, validate_stream(events)}
+    end
+  end
+
+  defp replay_all(_run_id, _cursor, 0, _pages),
+    do: {:error, {:event_replay_limit_exceeded, @stream_replay_limit}}
+
+  defp replay_all(run_id, cursor, remaining, pages) do
+    limit = min(remaining, @stream_replay_page_size)
+
+    case Jido.Harness.Run.replay(run_id, cursor: cursor, limit: limit) do
+      {:ok, []} ->
+        {:ok, pages |> Enum.reverse() |> List.flatten()}
+
+      {:ok, events} ->
+        next_cursor = List.last(events).sequence
+
+        if next_cursor > cursor do
+          replay_all(run_id, next_cursor, remaining - length(events), [events | pages])
+        else
+          {:error, {:event_replay_did_not_advance, cursor, next_cursor}}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp validate_stream(events) do
+    state =
+      Enum.reduce(events, %{open_tools: %{}, issues: []}, fn event, state ->
+        validate_event(event, state)
+      end)
+
+    open_ids = state.open_tools |> Map.keys() |> Enum.sort() |> Enum.take(20)
+
+    issues =
+      if open_ids == [] do
+        state.issues
+      else
+        [
+          %{
+            code: "incomplete_tool_calls",
+            count: map_size(state.open_tools),
+            call_ids: open_ids
+          }
+          | state.issues
+        ]
+      end
+
+    Enum.reverse(issues)
+  end
+
+  defp validate_event(%{type: :provider_event, payload: %{"decode_error" => error}}, state) do
+    add_stream_issue(state, %{code: "malformed_provider_event", error: error})
+  end
+
+  defp validate_event(
+         %{type: :provider_event, payload: %{"kind" => "decode_error"} = payload},
+         state
+       ) do
+    add_stream_issue(state, %{
+      code: "malformed_provider_event",
+      error: payload["error"] || payload["line"] || "decode_error"
+    })
+  end
+
+  defp validate_event(%{type: :tool_call, payload: payload}, state) do
+    case payload["call_id"] do
+      call_id when is_binary(call_id) and call_id != "" ->
+        if Map.has_key?(state.open_tools, call_id) do
+          add_stream_issue(state, %{code: "duplicate_tool_call", call_id: call_id})
+        else
+          %{state | open_tools: Map.put(state.open_tools, call_id, payload["name"])}
+        end
+
+      _other ->
+        add_stream_issue(state, %{code: "tool_call_id_missing"})
+    end
+  end
+
+  defp validate_event(%{type: :tool_result, payload: payload}, state) do
+    case payload["call_id"] do
+      call_id when is_binary(call_id) and call_id != "" ->
+        if Map.has_key?(state.open_tools, call_id) do
+          %{state | open_tools: Map.delete(state.open_tools, call_id)}
+        else
+          add_stream_issue(state, %{code: "orphan_tool_result", call_id: call_id})
+        end
+
+      _other ->
+        add_stream_issue(state, %{code: "tool_result_call_id_missing"})
+    end
+  end
+
+  defp validate_event(_event, state), do: state
+
+  defp add_stream_issue(state, issue), do: %{state | issues: [issue | state.issues]}
+
+  defp maybe_put(map, _key, []), do: map
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp normalize(nil), do: nil
+  defp normalize(value), do: Hancho.Log.Event.normalize(value)
 
   defp deadline(_started_at, :infinity), do: :infinity
   defp deadline(started_at, timeout), do: started_at + timeout

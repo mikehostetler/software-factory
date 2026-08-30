@@ -71,6 +71,69 @@ defmodule Hancho.InspectorTest do
     defp action("publish"), do: "Hancho.Actions.Land"
   end
 
+  defmodule FailureStore do
+    def open(_path), do: {:ok, :memory}
+
+    def fetch_run(:memory, "run-provider-failed") do
+      {:ok,
+       %{
+         "id" => "run-provider-failed",
+         "workflow_name" => "implement",
+         "status" => "stopped",
+         "current_step" => "implement",
+         "started_at" => "2026-08-17T10:00:00Z",
+         "finished_at" => "2026-08-17T10:00:05Z",
+         "error_json" => Jason.encode!(%{"code" => "provider_failed"}),
+         "outputs_json" => "{}"
+       }}
+    end
+
+    def list_steps(:memory, "run-provider-failed") do
+      {:ok,
+       [
+         %{
+           "position" => 0,
+           "name" => "implement",
+           "action" => "Hancho.Actions.Implement",
+           "status" => "stopped",
+           "started_at" => "2026-08-17T10:00:00Z",
+           "finished_at" => "2026-08-17T10:00:05Z",
+           "operation_json" =>
+             Jason.encode!(%{
+               kind: "jido_harness.run",
+               id: "harness-failed",
+               metadata: %{
+                 provider: "codex",
+                 terminal_status: "failed",
+                 error: "expired credentials"
+               },
+               history: [%{kind: "jido_harness.run", id: "harness-prior", metadata: %{}}]
+             }),
+           "repairs_json" => "[]",
+           "error_json" => Jason.encode!(%{"code" => "provider_failed"})
+         }
+       ]}
+    end
+
+    def list_effects(:memory, "run-provider-failed") do
+      {:ok,
+       [
+         %{
+           "step_position" => 0,
+           "key" => "create",
+           "kind" => "git.worktree.create",
+           "status" => "intended",
+           "attempt" => 1,
+           "started_at" => "2026-08-17T10:00:01Z",
+           "applied_at" => nil,
+           "intent_json" => Jason.encode!(%{"path" => "/repo/.hancho/worktrees/run"}),
+           "receipt_json" => nil,
+           "error_json" => nil
+         }
+       ]}
+    end
+  end
+
   test "reports durable timings, agent output, verification, and retained work" do
     project = Hancho.Project.new("/repo")
 
@@ -89,5 +152,23 @@ defmodule Hancho.InspectorTest do
     assert Enum.map(report.steps, & &1.duration_ms) == [10_000, 80_000, 15_000, 0, 15_000]
     assert List.last(report.steps).error == "branch changed"
     refute_received :store_flushed
+  end
+
+  test "reports failed provider and external-effect evidence without step output" do
+    project = Hancho.Project.new("/repo")
+
+    assert {:ok, report} =
+             Inspector.inspect(project, "run-provider-failed", store_api: FailureStore)
+
+    assert report.provider["harness_run_id"] == "harness-failed"
+    assert report.provider["provider"] == "codex"
+    assert report.provider["status"] == "failed"
+    assert report.provider["error"] == "expired credentials"
+    assert [%{"id" => "harness-prior"}] = report.provider["history"]
+
+    assert [effect] = report.effects
+    assert effect["status"] == "intended"
+    assert effect["intent"] == %{"path" => "/repo/.hancho/worktrees/run"}
+    assert hd(report.steps).operation["id"] == "harness-failed"
   end
 end

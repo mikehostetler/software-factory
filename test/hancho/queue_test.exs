@@ -303,6 +303,18 @@ defmodule Hancho.QueueTest do
       do: WorkflowRunner.run(project, workflow, input, options)
   end
 
+  defmodule MustNotRecoverWorkflow do
+    def retry(_project, _run_id, _options) do
+      send(self(), :unexpected_child_retry)
+      {:error, :must_not_retry}
+    end
+
+    def run(_project, _workflow, _input, _options) do
+      send(self(), :unexpected_child_run)
+      {:error, :must_not_run}
+    end
+  end
+
   defmodule MemoryStore do
     def open(_path), do: {:ok, :memory}
 
@@ -707,6 +719,67 @@ defmodule Hancho.QueueTest do
     assert_received {:ran, "task-1", "queue-pre-child-001"}
   end
 
+  test "adopts a completed child after a crash before queue bookkeeping" do
+    project = Hancho.Project.new(temporary_directory())
+    queue_id = "queue-completed-child"
+    run_id = "#{queue_id}-001"
+    item = %{position: 0, issue_id: "task-1", run_id: run_id}
+    state = %{repository: project.root, branch: "main", head: "head-0"}
+
+    assert {:ok, store} = Store.open(project.bedrock_path)
+    assert :ok = Store.create_queue(store, queue_id, "implement", "beadwork-ready", [item], state)
+    assert :ok = Store.start_queue_item(store, queue_id, 0)
+    assert :ok = create_completed_child(store, run_id, "head-task-1")
+    assert :ok = Store.flush(store)
+
+    assert {:ok, result} =
+             QueueRunner.resume(project, queue_id,
+               reconciler: Reconciler,
+               workflow_runner: MustNotRecoverWorkflow,
+               log: :disabled
+             )
+
+    assert result.status == :completed
+    assert result.completed_count == 1
+    refute_received :unexpected_child_retry
+    refute_received :unexpected_child_run
+
+    assert {:ok, queue} = Store.fetch_queue(store, queue_id)
+    assert queue["status"] == "completed"
+    assert hd(queue["items"])["status"] == "completed"
+  end
+
+  test "finishes a queue after a crash following final item bookkeeping" do
+    project = Hancho.Project.new(temporary_directory())
+    queue_id = "queue-final-bookkeeping"
+    run_id = "#{queue_id}-001"
+    item = %{position: 0, issue_id: "task-1", run_id: run_id}
+    state = %{repository: project.root, branch: "main", head: "head-0"}
+
+    assert {:ok, store} = Store.open(project.bedrock_path)
+    assert :ok = Store.create_queue(store, queue_id, "implement", "beadwork-ready", [item], state)
+    assert :ok = Store.start_queue_item(store, queue_id, 0)
+    assert :ok = create_completed_child(store, run_id, "head-task-1")
+    assert :ok = Store.complete_queue_item(store, queue_id, 0, "head-task-1")
+    assert :ok = Store.flush(store)
+
+    assert {:ok, result} =
+             QueueRunner.resume(project, queue_id,
+               reconciler: Reconciler,
+               workflow_runner: MustNotRecoverWorkflow,
+               log: :disabled
+             )
+
+    assert result.status == :completed
+    assert result.completed_count == 1
+    refute_received :unexpected_child_retry
+    refute_received :unexpected_child_run
+
+    assert {:ok, queue} = Store.fetch_queue(store, queue_id)
+    assert queue["status"] == "completed"
+    assert queue["current_position"] == 1
+  end
+
   test "stops before a child when reconciliation fails" do
     project = Hancho.Project.new(temporary_directory())
 
@@ -1104,6 +1177,33 @@ defmodule Hancho.QueueTest do
     end)
 
     path
+  end
+
+  defp create_completed_child(store, run_id, commit) do
+    yaml = """
+    name: implement
+    version: 1
+    steps:
+      - name: land
+        action: Hancho.Actions.Land
+        params: {}
+    """
+
+    source = %{
+      path: "implement.yaml",
+      yaml: yaml,
+      sha256: :crypto.hash(:sha256, yaml) |> Base.encode16(case: :lower)
+    }
+
+    with {:ok, values} <- YamlElixir.read_from_string(yaml),
+         {:ok, definition} <- Hancho.Workflow.Definition.new(values),
+         :ok <- Store.create_run(store, run_id, definition, %{"issue_id" => "task-1"}, source),
+         :ok <- Store.start_step(store, run_id, 0, hd(definition.steps), %{}),
+         output = %{"commit" => commit, "branch" => "main"},
+         :ok <- Store.complete_step(store, run_id, 0, output, %{}),
+         :ok <- Store.complete_run(store, run_id, %{"land" => output}) do
+      :ok
+    end
   end
 
   defp temporary_repository do
