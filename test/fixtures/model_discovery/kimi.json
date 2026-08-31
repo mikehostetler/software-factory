@@ -1,14 +1,16 @@
 {
-  "providers": [
-    {
+  "providers": {
+    "moonshot": {
       "id": "moonshot",
-      "models": [
-        {"id": "kimi-k2-test"},
-        {"id": "kimi-k2-fast"}
-      ],
+      "models": {
+        "kimi-k2-test": {"id": "kimi-k2-test"},
+        "kimi-k2-fast": {"id": "kimi-k2-fast"},
+        "api_key": "fixture-secret-must-not-appear"
+      },
       "apiKey": "fixture-secret-must-not-appear"
     }
-  ],
+  },
+  "models": {},
   "modelAliases": {
     "kimi-default": {"model": "kimi-k2-test"}
   }

@@ -3,12 +3,33 @@ defmodule Hancho.ModelDiscovery do
 
   @smoke_prompt "Reply with exactly HANCHO_MODEL_OK. Do not use tools or inspect files."
   @smoke_timeout_ms 120_000
+  @model_output_limit 4_194_304
   @disabled_tools [
+    "Agent",
+    "AskUserQuestion",
     "Bash",
     "Edit",
+    "EnterPlanMode",
+    "ExitPlanMode",
     "Glob",
     "Grep",
+    "KillShell",
+    "LSP",
+    "ListMcpResourcesTool",
+    "MultiEdit",
+    "NotebookEdit",
+    "NotebookRead",
     "Read",
+    "Skill",
+    "Task",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TaskUpdate",
+    "TodoRead",
+    "TodoWrite",
     "WebFetch",
     "WebSearch",
     "Write",
@@ -51,7 +72,7 @@ defmodule Hancho.ModelDiscovery do
        %{
          "providers" => providers,
          "schema_version" => 1,
-         "smoke_test_enabled" => Keyword.get(options, :smoke, true),
+         "smoke_test_enabled" => Keyword.get(options, :smoke, false),
          "source" => "repository_workflows"
        }}
     end
@@ -65,8 +86,8 @@ defmodule Hancho.ModelDiscovery do
   def format(%{"providers" => providers} = report) do
     header = [
       "Hancho models",
-      "Configured providers: #{length(providers)}",
-      "Safe smoke tests: #{if(report["smoke_test_enabled"], do: "enabled", else: "disabled")}"
+      "Configured provider targets: #{length(providers)}",
+      "Smoke tests: #{if(report["smoke_test_enabled"], do: "enabled", else: "disabled")}"
     ]
 
     sections = Enum.flat_map(providers, &["" | format_provider(&1)])
@@ -95,7 +116,8 @@ defmodule Hancho.ModelDiscovery do
   end
 
   def parse_models("kimi", output) do
-    with {:ok, values} <- Jason.decode(strip_ansi(output)) do
+    with {:ok, values} when is_map(values) <- Jason.decode(strip_ansi(output)),
+         true <- kimi_catalog?(values) do
       models =
         model_collections(values)
         |> Enum.flat_map(&collection_models/1)
@@ -108,54 +130,71 @@ defmodule Hancho.ModelDiscovery do
   end
 
   def parse_models("grok", output) do
-    models =
-      output
-      |> strip_ansi()
-      |> String.split("\n")
-      |> Enum.drop_while(&(String.trim(&1) != "Available models:"))
-      |> Enum.drop(1)
-      |> Enum.take_while(fn line -> Regex.match?(~r/^\s*[\*\-]\s+/, line) end)
-      |> Enum.map(fn line ->
-        line
-        |> String.replace(~r/^\s*[\*\-]\s+/, "")
-        |> String.replace(~r/\s+\(default\)\s*$/, "")
-      end)
-      |> normalize_models()
+    lines = output |> strip_ansi() |> String.split("\n")
 
-    {:ok, models}
+    case Enum.split_while(lines, &(String.trim(&1) != "Available models:")) do
+      {_before, [_heading | lines]} ->
+        models =
+          lines
+          |> Enum.take_while(fn line -> Regex.match?(~r/^\s*[\*\-]\s+/, line) end)
+          |> Enum.map(fn line ->
+            line
+            |> String.replace(~r/^\s*[\*\-]\s+/, "")
+            |> String.replace(~r/\s+\(default\)\s*$/, "")
+          end)
+          |> normalize_models()
+
+        {:ok, models}
+
+      {_before, []} ->
+        {:error, :invalid_output}
+    end
   end
 
   def parse_models("opencode", output) do
-    models =
+    lines =
       output
       |> strip_ansi()
       |> String.split("\n", trim: true)
       |> Enum.map(&String.trim/1)
-      |> Enum.filter(&Regex.match?(~r/^[A-Za-z0-9._-]+\/[A-Za-z0-9._:\/-]+$/, &1))
+
+    models =
+      lines
+      |> Enum.filter(&Regex.match?(~r/^[A-Za-z0-9._-]+\/[A-Za-z0-9._:\/@+-]+$/, &1))
       |> normalize_models()
 
-    {:ok, models}
+    if lines == [] or models != [], do: {:ok, models}, else: {:error, :invalid_output}
   end
 
   def parse_models("pi", output) do
-    models =
-      output
-      |> strip_ansi()
-      |> String.split("\n", trim: true)
-      |> Enum.drop_while(&(not Regex.match?(~r/^provider\s+model\s+/i, String.trim(&1))))
-      |> Enum.drop(1)
-      |> Enum.flat_map(fn line ->
-        case Regex.split(~r/\s{2,}/, String.trim(line), trim: true) do
-          [provider, model | _rest] ->
-            [if(String.contains?(model, "/"), do: model, else: "#{provider}/#{model}")]
+    clean = strip_ansi(output)
+    lines = String.split(clean, "\n", trim: true)
+    header = Enum.find_index(lines, &Regex.match?(~r/^provider\s+model\s+/i, String.trim(&1)))
 
-          _columns ->
-            []
-        end
-      end)
-      |> normalize_models()
+    cond do
+      is_integer(header) ->
+        models =
+          lines
+          |> Enum.drop(header + 1)
+          |> Enum.flat_map(fn line ->
+            case Regex.split(~r/\s{2,}/, String.trim(line), trim: true) do
+              [provider, model | _rest] ->
+                [if(String.contains?(model, "/"), do: model, else: "#{provider}/#{model}")]
 
-    {:ok, models}
+              _columns ->
+                []
+            end
+          end)
+          |> normalize_models()
+
+        {:ok, models}
+
+      lines == [] or String.contains?(String.downcase(clean), "no models available") ->
+        {:ok, []}
+
+      true ->
+        {:error, :invalid_output}
+    end
   end
 
   def parse_models(_provider, _output), do: {:error, :invalid_output}
@@ -239,7 +278,12 @@ defmodule Hancho.ModelDiscovery do
     base_report(provider, configured_cli, sources)
     |> Map.merge(%{
       "authentication" => "unknown",
-      "cli" => %{"installed" => false, "path" => configured_cli, "version" => nil},
+      "cli" => %{
+        "compatible" => nil,
+        "installed" => false,
+        "path" => configured_cli,
+        "version" => nil
+      },
       "model_discovery" => %{
         "status" => "unsupported",
         "detail" => "Provider is not registered in Harness."
@@ -262,7 +306,7 @@ defmodule Hancho.ModelDiscovery do
     reported_authentication = authentication(status, auth_hint(provider, model_discovery))
 
     smoke_tests =
-      smoke_tests(spec, configured_cli, sources, reported_authentication, project, options)
+      smoke_tests(spec, executable, installed, sources, reported_authentication, project, options)
 
     authentication = authentication_after_smoke(reported_authentication, smoke_tests)
 
@@ -325,11 +369,7 @@ defmodule Hancho.ModelDiscovery do
   end
 
   defp resolve_executable(path) do
-    cond do
-      Path.type(path) == :absolute and File.regular?(path) -> path
-      Path.type(path) == :absolute -> nil
-      true -> System.find_executable(path)
-    end
+    System.find_executable(path)
   end
 
   defp executable_available?(path), do: resolve_executable(path) != nil
@@ -353,13 +393,13 @@ defmodule Hancho.ModelDiscovery do
     case command.run(executable, @model_commands[provider],
            cwd: project.root,
            timeout: 30_000,
-           capture_limit: 4_194_304
+           capture_limit: @model_output_limit
          ) do
       {:ok, %{exit_status: 0, stdout_truncated: false} = result} ->
         case parse_models(provider, result.stdout) do
           {:ok, models} ->
             %{
-              "authentication_hint" => output_authentication(provider, result.stdout),
+              "authentication_hint" => output_authentication(provider, command_output(result)),
               "detail" => if(models == [], do: "CLI reported no models.", else: nil),
               "models" => models,
               "status" => if(models == [], do: "empty", else: "reported")
@@ -367,33 +407,40 @@ defmodule Hancho.ModelDiscovery do
 
           {:error, :invalid_output} ->
             %{
+              "authentication_hint" => output_authentication(provider, command_output(result)),
               "models" => [],
               "status" => "failed",
               "detail" => "CLI model output was not recognized."
             }
         end
 
-      {:ok, %{exit_status: exit_status}} ->
-        %{
-          "models" => [],
-          "status" => "failed",
-          "detail" => "CLI model command exited with status #{exit_status}."
-        }
+      {:ok, %{stdout_truncated: true} = result} ->
+        failed_model_discovery(provider, result, "CLI model output exceeded the capture limit.")
+
+      {:ok, %{exit_status: exit_status} = result} ->
+        failed_model_discovery(
+          provider,
+          result,
+          "CLI model command exited with status #{exit_status}."
+        )
 
       {:error, _reason} ->
         %{"models" => [], "status" => "failed", "detail" => "CLI model command did not complete."}
     end
   end
 
-  defp smoke_tests(spec, configured_cli, sources, authentication, project, options) do
+  defp smoke_tests(spec, executable, installed, sources, authentication, project, options) do
     models = configured_models(sources)
 
     cond do
       models == [] ->
         []
 
-      not Keyword.get(options, :smoke, true) ->
+      not Keyword.get(options, :smoke, false) ->
         smoke_not_run(sources, "Smoke tests were disabled.")
+
+      not installed or is_nil(executable) ->
+        smoke_not_run(sources, "CLI executable is not available.")
 
       authentication == "unauthenticated" ->
         smoke_not_run(sources, "Provider is not authenticated.")
@@ -405,29 +452,33 @@ defmodule Hancho.ModelDiscovery do
         smoke_not_run(sources, "Harness cannot enforce a read-only smoke test for this provider.")
 
       true ->
-        Enum.map(models, &run_smoke(spec, configured_cli, &1, project, options))
+        Enum.map(models, &run_smoke(spec, executable, &1, project, options))
     end
   end
 
-  defp run_smoke(spec, configured_cli, model, project, options) do
+  defp run_smoke(spec, executable, model, project, options) do
     harness = Keyword.get(options, :harness, Jido.Harness)
-    directory = smoke_directory(project, spec.provider, model)
-    :ok = File.mkdir_p(directory)
-    :ok = File.chmod(directory, 0o700)
+    configured_cli = if executable == spec.executable, do: nil, else: executable
 
-    try do
-      run_options = smoke_options(spec, configured_cli, directory, model)
+    case create_smoke_directory(project, spec.provider, model) do
+      {:ok, directory} ->
+        try do
+          run_options = smoke_options(spec, configured_cli, directory, model)
 
-      case harness.run(spec.provider, @smoke_prompt, run_options) do
-        {:ok, result} -> smoke_result(model, result)
-        {:error, _reason} -> rejected_smoke(model, "Provider rejected the smoke request.")
-      end
-    rescue
-      _error -> rejected_smoke(model, "Provider smoke request did not complete.")
-    catch
-      _kind, _reason -> rejected_smoke(model, "Provider smoke request did not complete.")
-    after
-      File.rm_rf(directory)
+          case harness.run(spec.provider, @smoke_prompt, run_options) do
+            {:ok, result} -> smoke_result(model, result)
+            {:error, _reason} -> rejected_smoke(model, "Provider rejected the smoke request.")
+          end
+        rescue
+          _error -> rejected_smoke(model, "Provider smoke request did not complete.")
+        catch
+          _kind, _reason -> rejected_smoke(model, "Provider smoke request did not complete.")
+        after
+          File.rm_rf(directory)
+        end
+
+      {:error, _reason} ->
+        rejected_smoke(model, "A private smoke-test directory could not be created.")
     end
   end
 
@@ -436,6 +487,7 @@ defmodule Hancho.ModelDiscovery do
 
     provider_options =
       security.provider_options
+      |> Map.merge(smoke_provider_options(spec.provider))
       |> maybe_put(:cli_path, configured_cli)
 
     [
@@ -448,27 +500,52 @@ defmodule Hancho.ModelDiscovery do
       await_timeout: @smoke_timeout_ms + 5_000,
       provider_options: provider_options
     ]
-    |> maybe_option(
-      :allowed_tools,
-      smoke_allowed_tools(spec),
-      :allowed_tools in spec.normalized_options and
-        :disallowed_tools not in spec.normalized_options
-    )
-    |> maybe_option(
-      :disallowed_tools,
-      @disabled_tools,
-      :disallowed_tools in spec.normalized_options
-    )
+    |> smoke_tool_options(spec)
     |> maybe_option(:max_turns, 1, :max_turns in spec.normalized_options)
+  end
+
+  defp smoke_provider_options(:codex) do
+    %{network_access_enabled: false, skip_git_repo_check: true}
+  end
+
+  defp smoke_provider_options(:pi) do
+    %{
+      no_context_files: true,
+      no_extensions: true,
+      no_session: true,
+      no_skills: true,
+      project_trust: :deny
+    }
+  end
+
+  defp smoke_provider_options(_provider), do: %{}
+
+  defp smoke_tool_options(options, %{provider: provider} = spec) when provider in [:grok, :pi] do
+    maybe_option(options, :allowed_tools, [], :allowed_tools in spec.normalized_options)
+  end
+
+  defp smoke_tool_options(options, spec) do
+    cond do
+      :disallowed_tools in spec.normalized_options ->
+        Keyword.put(options, :disallowed_tools, @disabled_tools)
+
+      :allowed_tools in spec.normalized_options ->
+        Keyword.put(options, :allowed_tools, ["__hancho_no_tools__"])
+
+      true ->
+        options
+    end
   end
 
   defp smoke_result(requested_model, result) do
     effective_model = effective_model(result)
     response = value(result, :text)
+    tool_use_observed = tool_use_observed?(result)
 
     completed =
       value(result, :status) in [:completed, "completed"] and
-        is_binary(response) and String.trim(response) == "HANCHO_MODEL_OK"
+        is_binary(response) and String.trim(response) == "HANCHO_MODEL_OK" and
+        not tool_use_observed
 
     accepted = completed and effective_model in [nil, requested_model]
 
@@ -481,11 +558,16 @@ defmodule Hancho.ModelDiscovery do
 
     %{
       "accepted" => accepted,
-      "detail" => smoke_detail(status),
+      "detail" =>
+        if(tool_use_observed,
+          do: "Provider used a tool during the smoke request.",
+          else: smoke_detail(status)
+        ),
       "effective_model" => effective_model,
       "effective_model_observed" => is_binary(effective_model),
       "requested_model" => requested_model,
-      "status" => status
+      "status" => status,
+      "tool_use_observed" => tool_use_observed
     }
   end
 
@@ -496,7 +578,8 @@ defmodule Hancho.ModelDiscovery do
       "effective_model" => nil,
       "effective_model_observed" => false,
       "requested_model" => model,
-      "status" => "rejected"
+      "status" => "rejected",
+      "tool_use_observed" => false
     }
   end
 
@@ -510,27 +593,70 @@ defmodule Hancho.ModelDiscovery do
         "effective_model" => nil,
         "effective_model_observed" => false,
         "requested_model" => model,
-        "status" => "not_run"
+        "status" => "not_run",
+        "tool_use_observed" => false
       }
     end)
   end
 
-  defp smoke_directory(project, provider, model) do
+  defp create_smoke_directory(project, provider, model) do
     digest = :crypto.hash(:sha256, model) |> Base.encode16(case: :lower) |> binary_part(0, 12)
+    random = :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
 
-    Path.join(
-      System.tmp_dir!(),
-      "hancho-model-smoke-#{Path.basename(project.root)}-#{provider}-#{digest}-#{System.unique_integer([:positive])}"
-    )
+    directory =
+      Path.join(
+        System.tmp_dir!(),
+        "hancho-model-smoke-#{Path.basename(project.root)}-#{provider}-#{digest}-#{random}"
+      )
+
+    case File.mkdir(directory) do
+      :ok ->
+        case File.chmod(directory, 0o700) do
+          :ok ->
+            {:ok, directory}
+
+          {:error, _reason} = error ->
+            File.rmdir(directory)
+            error
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   defp effective_model(result) do
     result
     |> value(:events, [])
     |> Enum.find_value(fn event ->
-      payload = value(event, :payload, %{})
-      payload["model"] || payload[:model]
+      if value(event, :type) in [:run_started, "run_started"] do
+        payload = value(event, :payload, %{})
+
+        case payload["model"] || payload[:model] do
+          model when is_binary(model) and byte_size(model) <= 256 ->
+            model = String.trim(model)
+            if model_name?(model), do: model
+
+          _model ->
+            nil
+        end
+      end
     end)
+  end
+
+  defp tool_use_observed?(result) do
+    result
+    |> value(:events, [])
+    |> Enum.any?(
+      &(value(&1, :type) in [
+          :tool_call,
+          "tool_call",
+          :tool_result,
+          "tool_result",
+          :file_change,
+          "file_change"
+        ])
+    )
   end
 
   defp accepted_models(tests) do
@@ -547,10 +673,15 @@ defmodule Hancho.ModelDiscovery do
   end
 
   defp reasoning_levels(spec) do
-    spec.normalized_values
-    |> Map.get(:reasoning_effort, [])
-    |> Enum.reject(&is_nil/1)
-    |> Enum.map(&to_string/1)
+    if :reasoning_effort in spec.normalized_options do
+      spec.normalized_values
+      |> Map.get(:reasoning_effort, [])
+      |> Enum.reject(&is_nil/1)
+      |> Enum.map(&to_string/1)
+      |> Enum.uniq()
+    else
+      []
+    end
   end
 
   defp safe_approval(spec) do
@@ -565,14 +696,17 @@ defmodule Hancho.ModelDiscovery do
       (not is_list(accepted) or :read_only in accepted)
   end
 
-  defp smoke_allowed_tools(%{provider: :pi}), do: []
-  defp smoke_allowed_tools(_spec), do: ["__hancho_no_tools__"]
-
   defp authentication(status, hint) do
-    case value(status, :authenticated) do
-      true -> "authenticated"
-      false -> "unauthenticated"
-      _unknown -> hint || "unknown"
+    case hint do
+      hint when hint in ["authenticated", "unauthenticated"] ->
+        hint
+
+      _hint ->
+        case value(status, :authenticated) do
+          true -> "authenticated"
+          false -> "unauthenticated"
+          _unknown -> "unknown"
+        end
     end
   end
 
@@ -585,7 +719,13 @@ defmodule Hancho.ModelDiscovery do
   defp auth_hint(_provider, model_discovery), do: model_discovery["authentication_hint"]
 
   defp output_authentication("grok", output) do
-    if String.contains?(String.downcase(output), "not authenticated"), do: "unauthenticated"
+    output = String.downcase(output)
+
+    cond do
+      String.contains?(output, "not authenticated") -> "unauthenticated"
+      String.contains?(output, "you are logged in with") -> "authenticated"
+      true -> nil
+    end
   end
 
   defp output_authentication("pi", output) do
@@ -600,10 +740,15 @@ defmodule Hancho.ModelDiscovery do
     provider_models =
       values
       |> Map.get("providers", [])
-      |> List.wrap()
+      |> provider_values()
       |> Enum.flat_map(fn
         provider when is_map(provider) ->
-          [provider["models"], provider["modelAliases"], provider["aliases"]]
+          [
+            provider["models"],
+            provider["modelAliases"],
+            provider["model_aliases"],
+            provider["aliases"]
+          ]
 
         _provider ->
           []
@@ -612,15 +757,33 @@ defmodule Hancho.ModelDiscovery do
     Enum.reject(direct ++ provider_models, &is_nil/1)
   end
 
-  defp model_collections(_values), do: []
+  defp kimi_catalog?(values) do
+    Enum.any?(
+      ["models", "providers", "modelAliases", "model_aliases", "aliases"],
+      &Map.has_key?(values, &1)
+    )
+  end
+
+  defp provider_values(values) when is_list(values), do: values
+  defp provider_values(values) when is_map(values), do: Map.values(values)
+  defp provider_values(_values), do: []
 
   defp collection_models(values) when is_list(values),
     do: Enum.flat_map(values, &model_value(&1, ["id", "model", "name"]))
 
   defp collection_models(values) when is_map(values) do
-    Enum.flat_map(values, fn {name, value} ->
-      model_value(value, ["id", "model", "name"]) ++ if(model_name?(name), do: [name], else: [])
-    end)
+    if Enum.any?(["id", "model", "name"], &Map.has_key?(values, &1)) do
+      model_value(values, ["id", "model", "name"])
+    else
+      Enum.flat_map(values, fn {name, value} ->
+        if sensitive_key?(name) do
+          []
+        else
+          model_value(value, ["id", "model", "name"]) ++
+            if(model_name?(name), do: [name], else: [])
+        end
+      end)
+    end
   end
 
   defp collection_models(_values), do: []
@@ -639,7 +802,31 @@ defmodule Hancho.ModelDiscovery do
   defp model_value(_value, _keys), do: []
 
   defp model_name?(name),
-    do: is_binary(name) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9._:\/-]+$/, name)
+    do:
+      is_binary(name) and byte_size(name) <= 256 and
+        Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9._:\/@+-]+$/, name)
+
+  defp sensitive_key?(name) when is_binary(name) do
+    normalized = name |> String.downcase() |> String.replace(~r/[^a-z0-9]/, "")
+
+    normalized in [
+      "api",
+      "apikey",
+      "apitoken",
+      "auth",
+      "authorization",
+      "key",
+      "refreshtoken",
+      "sessiontoken",
+      "token"
+    ] or
+      Enum.any?(
+        ["accesstoken", "authtoken", "credential", "password", "privatekey", "secret"],
+        &String.contains?(normalized, &1)
+      )
+  end
+
+  defp sensitive_key?(_name), do: false
 
   defp normalize_models(models) do
     models
@@ -680,6 +867,18 @@ defmodule Hancho.ModelDiscovery do
   defp smoke_detail("accepted"), do: nil
   defp smoke_detail("fallback_observed"), do: "CLI used a different effective model."
   defp smoke_detail(_status), do: "Smoke request did not complete successfully."
+
+  defp command_output(result),
+    do: value(result, :stdout, "") <> "\n" <> value(result, :stderr, "")
+
+  defp failed_model_discovery(provider, result, detail) do
+    %{
+      "authentication_hint" => output_authentication(provider, command_output(result)),
+      "models" => [],
+      "status" => "failed",
+      "detail" => detail
+    }
+  end
 
   defp join_or_none([]), do: "none"
   defp join_or_none(values), do: Enum.join(values, ", ")

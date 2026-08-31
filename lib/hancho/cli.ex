@@ -7,7 +7,7 @@ defmodule Hancho.CLI do
   Usage:
     hancho init       Initialize Hancho in the current repository
     hancho doctor     Inspect the repository and local tools
-    hancho models [--json] [--no-smoke]
+    hancho models [--json] [--smoke]
                       Discover model evidence for configured CLI providers
     hancho run WORKFLOW ISSUE_ID [--verbose]
                       Run one Beadwork workflow in the foreground
@@ -115,7 +115,7 @@ defmodule Hancho.CLI do
            {:ok, report} <-
              models_api(options).discover(
                project,
-               Keyword.put(options, :smoke, Keyword.get(parsed, :smoke, true))
+               Keyword.put(options, :smoke, Keyword.get(parsed, :smoke, false))
              ) do
         if parsed[:json] do
           IO.puts(Jason.encode!(report, pretty: true))

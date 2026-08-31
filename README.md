@@ -183,12 +183,16 @@ The command keeps these facts separate:
   is `authenticated`, `unauthenticated`, or `unknown`; `unknown` is retained
   when a cached CLI login cannot be proved without a request.
 
-Smoke tests are enabled by default and can use a small amount of provider quota.
-They run in a new empty temporary directory with read-only sandbox and prompt
-approval settings. Use `hancho models --no-smoke` for catalog and configuration
-evidence only. Use `hancho models --json` for schema-versioned machine-readable output.
-The report extracts model identifiers and normalized status only. It does not
-copy provider command output, environment values, credentials, or raw errors.
+Smoke tests are disabled by default because they can use provider quota. Use
+`hancho models --smoke` to run them. They run in a new private empty temporary
+directory with a read-only sandbox and the safest approval setting supported by
+the adapter. A smoke result is not accepted if the provider reports a tool call
+or file change. Codex also disables workspace network access and skips only its
+Git-repository check. Pi disables tools, extensions, skills, context files, and
+session persistence. Use `hancho models --json` for schema-versioned
+machine-readable output. The report extracts model identifiers and normalized
+status only. It does not copy provider command output, environment values,
+credentials, or raw errors.
 
 Hancho requests the Harness `workspace_write` sandbox for adapters that support
 it. Amp, Kimi, OpenCode, and Pi use their adapter default because they cannot

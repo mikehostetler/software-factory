@@ -28,6 +28,7 @@ defmodule Hancho.ModelDiscoveryCLITest do
              "supported_reasoning_levels" => ["low", "high"]
            }
          ],
+         "schema_version" => 1,
          "smoke_test_enabled" => options[:smoke],
          "source" => "repository_workflows"
        }}
@@ -36,7 +37,7 @@ defmodule Hancho.ModelDiscoveryCLITest do
     def format(report), do: "Human model report for #{length(report["providers"])} provider"
   end
 
-  test "prints clear human model discovery output" do
+  test "prints clear human model discovery output without smoke tests by default" do
     output =
       capture_io(fn ->
         assert Hancho.CLI.run(["models"],
@@ -47,20 +48,22 @@ defmodule Hancho.ModelDiscoveryCLITest do
       end)
 
     assert output == "Human model report for 1 provider\n"
-    assert_received {:model_discovery, "/repo", true}
+    assert_received {:model_discovery, "/repo", false}
   end
 
-  test "prints JSON and supports disabling smoke tests" do
+  test "prints schema-versioned JSON and supports enabling smoke tests" do
     output =
       capture_io(fn ->
-        assert Hancho.CLI.run(["models", "discover", "--json", "--no-smoke"],
+        assert Hancho.CLI.run(["models", "discover", "--json", "--smoke"],
                  cwd: "/repo",
                  project_api: ProjectAPI,
                  models_api: ModelsAPI
                ) == 0
       end)
 
-    assert Jason.decode!(output)["smoke_test_enabled"] == false
-    assert_received {:model_discovery, "/repo", false}
+    decoded = Jason.decode!(output)
+    assert decoded["schema_version"] == 1
+    assert decoded["smoke_test_enabled"] == true
+    assert_received {:model_discovery, "/repo", true}
   end
 end
