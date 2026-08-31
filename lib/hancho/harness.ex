@@ -204,70 +204,70 @@ defmodule Hancho.Harness do
         )
 
       {:error, :timeout} ->
-        if expired?(deadline) do
-          {:error, :timeout}
-        else
-          {next_cursor, latest, events} = replay(run_id, cursor, latest)
-          now = now()
+        {next_cursor, latest, events} = replay(run_id, cursor, latest)
+        now = now()
 
-          {last_activity_at, andon_warned?} =
-            activity_state(events, now, last_activity_at, andon_warned?)
+        {last_activity_at, andon_warned?} =
+          activity_state(events, now, last_activity_at, andon_warned?)
 
-          {last_productive_at, productive_warned?, productive_event_count, last_productive} =
-            productivity_state(
-              events,
-              now,
-              last_productive_at,
-              productive_warned?,
-              productive_event_count,
-              last_productive
-            )
+        {last_productive_at, productive_warned?, productive_event_count, last_productive} =
+          productivity_state(
+            events,
+            now,
+            last_productive_at,
+            productive_warned?,
+            productive_event_count,
+            last_productive
+          )
 
-          warn? =
-            not andon_warned? and now - last_activity_at >= andon_warning_ms
+        warn? =
+          not andon_warned? and now - last_activity_at >= andon_warning_ms
 
-          productive_warn? =
-            not productive_warned? and
-              now - last_productive_at >= productive_warning_ms
+        productive_warn? =
+          not productive_warned? and
+            now - last_productive_at >= productive_warning_ms
 
-          with :ok <- notify_events(event_callback, events),
-               :ok <-
-                 maybe_notify_andon(
-                   callback,
-                   warn?,
-                   run_id,
-                   provider,
-                   started_at,
-                   next_cursor,
-                   latest,
-                   now - last_activity_at,
-                   andon_warning_ms
-                 ),
-               :ok <-
-                 maybe_notify_productivity_andon(
-                   callback,
-                   productive_warn?,
-                   run_id,
-                   provider,
-                   started_at,
-                   next_cursor,
-                   latest,
-                   now - last_productive_at,
-                   productive_warning_ms,
-                   productive_event_count,
-                   last_productive
-                 ),
-               :ok <-
-                 maybe_notify_progress(
-                   callback,
-                   now,
-                   next_progress_at,
-                   run_id,
-                   provider,
-                   started_at,
-                   next_cursor,
-                   latest
-                 ) do
+        with :ok <- notify_events(event_callback, events),
+             :ok <-
+               maybe_notify_andon(
+                 callback,
+                 warn?,
+                 run_id,
+                 provider,
+                 started_at,
+                 next_cursor,
+                 latest,
+                 now - last_activity_at,
+                 andon_warning_ms
+               ),
+             :ok <-
+               maybe_notify_productivity_andon(
+                 callback,
+                 productive_warn?,
+                 run_id,
+                 provider,
+                 started_at,
+                 next_cursor,
+                 latest,
+                 now - last_productive_at,
+                 productive_warning_ms,
+                 productive_event_count,
+                 last_productive
+               ),
+             :ok <-
+               maybe_notify_progress(
+                 callback,
+                 now,
+                 next_progress_at,
+                 run_id,
+                 provider,
+                 started_at,
+                 next_cursor,
+                 latest
+               ) do
+          if expired?(deadline) do
+            {:error, :timeout}
+          else
             await_next(
               run_id,
               provider,

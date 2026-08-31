@@ -29,18 +29,6 @@ defmodule Hancho.Actions.Implement do
   alias Hancho.Actions.Context
   alias Hancho.Harness.EventConsole
 
-  @providers %{
-    "amp" => :amp,
-    "claude" => :claude,
-    "codex" => :codex,
-    "gemini" => :gemini,
-    "grok" => :grok,
-    "kimi" => :kimi,
-    "opencode" => :opencode,
-    "pi" => :pi,
-    "zai" => :zai
-  }
-
   @impl true
   def run(params, context) do
     harness = Context.service(context, :harness, Hancho.Harness)
@@ -48,13 +36,13 @@ defmodule Hancho.Actions.Implement do
     repository = Map.get(params, :repo_path) || repository_from_worktree(params.worktree_path)
 
     with {:ok, provider} <- fetch_provider(params.provider),
-         :ok <- validate_reasoning(provider, Map.get(params, :reasoning_effort)),
+         :ok <- Hancho.ProviderContract.validate(provider, params),
          :ok <- validate_network_access(provider, Map.get(params, :network_access, false)),
          :ok <- validate_network_hosts(provider, Map.get(params, :network_hosts, [])),
          {:ok, mix_paths} <- worktree_setup.prepare(params.worktree_path),
          {:ok, prior_run} <- prior_harness_run(context),
          security = Hancho.ProviderSecurity.options(provider, Map.get(params, :network_hosts, [])),
-         :ok <- audit_configuration(context, params, mix_paths, security),
+         :ok <- audit_configuration(context, provider, params, mix_paths, security),
          provider_started_at = System.monotonic_time(:millisecond),
          {:ok, result} <-
            run_harness(
@@ -117,7 +105,8 @@ defmodule Hancho.Actions.Implement do
         cwd: params.worktree_path,
         model: Map.get(params, :model),
         env: mix_paths.env,
-        approval_mode: approval_mode(provider),
+        approval_mode:
+          approval_mode(provider, sandbox_mode(provider, Map.get(params, :sandbox_mode))),
         sandbox_mode: sandbox_mode(provider, Map.get(params, :sandbox_mode)),
         runtime_timeout_ms: params.timeout_ms,
         idle_timeout_ms: min(params.idle_timeout_ms, params.timeout_ms),
@@ -148,9 +137,13 @@ defmodule Hancho.Actions.Implement do
 
   # Hancho has no interactive approval responder. Use an automatic mode only
   # when the adapter can represent it. Amp and Kimi accept only the default.
-  defp approval_mode(provider) when provider in [:grok, :opencode, :pi], do: :auto_approve
-  defp approval_mode(provider) when provider in [:amp, :kimi], do: :default
-  defp approval_mode(_provider), do: :auto_edit
+  defp approval_mode(:gemini, :read_only), do: :prompt
+
+  defp approval_mode(provider, _sandbox) when provider in [:grok, :opencode, :pi],
+    do: :auto_approve
+
+  defp approval_mode(provider, _sandbox) when provider in [:amp, :kimi], do: :default
+  defp approval_mode(_provider, _sandbox), do: :auto_edit
 
   # Some CLIs do not implement Harness workspace-write isolation. Their
   # adapters reject that normalized value, so keep their provider default. All
@@ -169,13 +162,6 @@ defmodule Hancho.Actions.Implement do
   defp reasoning_options(_provider, "low"), do: [reasoning_effort: :low]
   defp reasoning_options(_provider, "medium"), do: [reasoning_effort: :medium]
   defp reasoning_options(_provider, "high"), do: [reasoning_effort: :high]
-
-  defp validate_reasoning(provider, "xhigh") when provider in [:codex, :grok], do: :ok
-
-  defp validate_reasoning(_provider, "xhigh"),
-    do: {:error, "The selected Harness provider does not support xhigh reasoning."}
-
-  defp validate_reasoning(_provider, _effort), do: :ok
 
   defp validate_network_access(:codex, true), do: :ok
   defp validate_network_access(_provider, false), do: :ok
@@ -227,17 +213,14 @@ defmodule Hancho.Actions.Implement do
     end
   end
 
-  defp audit_configuration(context, params, mix_paths, security) do
+  defp audit_configuration(context, provider, params, mix_paths, security) do
     Hancho.Audit.write(Map.get(context, :log, :disabled), "Provider configuration",
       event: "implement.configuration",
       metadata: %{
         provider: params.provider,
         model: Map.get(params, :model),
         model_source: model_source(params),
-        sandbox_mode:
-          Atom.to_string(
-            sandbox_mode(provider_atom(params.provider), Map.get(params, :sandbox_mode))
-          ),
+        sandbox_mode: Atom.to_string(sandbox_mode(provider, Map.get(params, :sandbox_mode))),
         network_access: Map.get(params, :network_access, false),
         network_hosts: Map.get(params, :network_hosts, []),
         mix_paths: Map.drop(mix_paths, [:env]),
@@ -249,8 +232,6 @@ defmodule Hancho.Actions.Implement do
   defp model_source(params) do
     if is_binary(Map.get(params, :model)), do: "configured", else: "provider_default_unpinned"
   end
-
-  defp provider_atom(name), do: Map.fetch!(@providers, name)
 
   defp write_progress(context, %{phase: :andon} = progress) do
     {label, event} = andon_activity(context)
@@ -421,12 +402,7 @@ defmodule Hancho.Actions.Implement do
     end
   end
 
-  defp fetch_provider(name) do
-    case Map.fetch(@providers, name) do
-      {:ok, provider} -> {:ok, provider}
-      :error -> {:error, "Unknown Jido.Harness provider: #{name}"}
-    end
-  end
+  defp fetch_provider(name), do: Hancho.ProviderContract.provider(name)
 
   defp completed(%{status: :completed}), do: :ok
 

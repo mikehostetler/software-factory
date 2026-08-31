@@ -216,8 +216,9 @@ defmodule Hancho.HarnessTest do
     assert result.run_id == run_id
     assert result.status == :completed
 
-    assert_received {:events, events}
+    events = received_events()
     assert Enum.any?(events, &(&1.type == :run_completed))
+    assert Enum.map(events, & &1.sequence) == Enum.to_list(1..length(events))
 
     assert {:ok, info} = Jido.Harness.Run.info(run_id)
     assert String.starts_with?(info.journal_dir, Path.join(directory, "journals"))
@@ -524,6 +525,14 @@ defmodule Hancho.HarnessTest do
       ["--config", value] -> [value]
       _pair -> []
     end)
+  end
+
+  defp received_events(batches \\ []) do
+    receive do
+      {:events, events} -> received_events([events | batches])
+    after
+      0 -> batches |> Enum.reverse() |> List.flatten()
+    end
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:jido_harness, key)
