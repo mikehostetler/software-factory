@@ -27,6 +27,13 @@ defmodule Hancho.ProviderContract do
     "xhigh" => :xhigh
   }
 
+  @extra_arg_adapters %{
+    grok: Jido.Harness.Adapters.Grok,
+    kimi: Jido.Harness.Adapters.Kimi,
+    opencode: Jido.Harness.Adapters.OpenCode,
+    pi: Jido.Harness.Adapters.Pi
+  }
+
   @spec providers() :: %{String.t() => atom()}
   def providers, do: @providers
 
@@ -44,7 +51,7 @@ defmodule Hancho.ProviderContract do
          :ok <- validate_cli(spec, Map.get(params, :cli)),
          :ok <- validate_model(spec, Map.get(params, :model)),
          :ok <- validate_reasoning(spec, Map.get(params, :reasoning_effort)),
-         :ok <- validate_extra_args(spec, Map.get(params, :extra_args, [])),
+         :ok <- validate_extra_args(provider, spec, Map.get(params, :extra_args, [])),
          :ok <- validate_sandbox(spec, Map.get(params, :sandbox_mode)) do
       :ok
     end
@@ -92,10 +99,34 @@ defmodule Hancho.ProviderContract do
     end
   end
 
-  defp validate_extra_args(_spec, []), do: :ok
+  defp validate_extra_args(_provider, _spec, []), do: :ok
 
-  defp validate_extra_args(spec, _args) do
-    require_provider_option(spec, :extra_args, "extra arguments")
+  defp validate_extra_args(provider, spec, args) do
+    with :ok <- require_provider_option(spec, :extra_args, "extra arguments"),
+         {:ok, request} <-
+           Jido.Harness.RunRequest.new(%{
+             prompt: "Validate Hancho provider arguments.",
+             provider: provider,
+             provider_options: %{extra_args: args}
+           }),
+         adapter when not is_nil(adapter) <- Map.get(@extra_arg_adapters, provider),
+         {:ok, _argv} <- adapter.build_argv(request, %{extra_args: args}) do
+      :ok
+    else
+      {:error, %Jido.Harness.Error{details: %{argument: argument}}} ->
+        {:error,
+         "The #{provider} Harness adapter does not allow extra argument #{inspect(argument)} " <>
+           "because it conflicts with a managed option."}
+
+      {:error, %Jido.Harness.Error{} = error} ->
+        {:error, Exception.message(error)}
+
+      {:error, message} when is_binary(message) ->
+        {:error, message}
+
+      nil ->
+        {:error, "Hancho cannot validate extra arguments for the #{provider} Harness adapter."}
+    end
   end
 
   defp validate_sandbox(_spec, nil), do: :ok

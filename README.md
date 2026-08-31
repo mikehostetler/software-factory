@@ -186,9 +186,11 @@ provider failure produces a terminal result with a normalized category,
 provider name, Harness run ID, and cause when one is available.
 
 Hancho validates model, reasoning, extra-argument, and sandbox selections
-before it prepares the workspace. This prevents a provider-specific option
-error from starting implementation work. Gemini read-only runs use prompt
-approval because Gemini does not permit automatic approval in read-only mode.
+before it prepares the workspace. The extra-argument check also rejects values
+that conflict with Harness-managed CLI options. This prevents a
+provider-specific option error from starting implementation work. Gemini
+read-only runs use prompt approval because Gemini does not permit automatic
+approval in read-only mode.
 
 The provider contract tests use deterministic fixture adapters. They do not
 need installed provider CLIs or live credentials. The fixtures cover ordered

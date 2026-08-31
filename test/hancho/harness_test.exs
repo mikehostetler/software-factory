@@ -63,8 +63,8 @@ defmodule Hancho.HarnessTest do
        Stream.map(
          [
            {0, :thinking_delta, "first"},
-           {30, :thinking_delta, "second"},
-           {30, :output_text_final, "done"}
+           {100, :thinking_delta, "second"},
+           {100, :output_text_final, "done"}
          ],
          fn {delay, type, text} ->
            Process.sleep(delay)
@@ -156,8 +156,9 @@ defmodule Hancho.HarnessTest do
     assert result.run_id == run_id
     assert result.status == :completed
 
-    assert_received {:events, events}
+    events = received_events()
     assert Enum.any?(events, &(&1.type == :run_completed))
+    assert Enum.map(events, & &1.sequence) == Enum.to_list(1..length(events))
 
     assert {:ok, info} = Jido.Harness.Run.info(run_id)
     assert String.starts_with?(info.journal_dir, Path.join(directory, "journals"))
@@ -263,7 +264,7 @@ defmodule Hancho.HarnessTest do
                  runtime_timeout_ms: 1_000,
                  idle_timeout_ms: 1_000,
                  progress_interval_ms: 5,
-                 andon_warning_ms: 10
+                 andon_warning_ms: 20
                ],
                fn progress ->
                  send(test_pid, {:pulsed_progress, progress})
@@ -272,8 +273,8 @@ defmodule Hancho.HarnessTest do
              )
 
     assert result.status == :completed
-    assert_received {:pulsed_progress, %{phase: :andon, andon_warning_ms: 10}}
-    assert_received {:pulsed_progress, %{phase: :andon, andon_warning_ms: 10}}
+    assert_received {:pulsed_progress, %{phase: :andon, andon_warning_ms: 20}}
+    assert_received {:pulsed_progress, %{phase: :andon, andon_warning_ms: 20}}
     refute_received {:pulsed_progress, %{phase: :andon}}
     assert :ok = Jido.Harness.Run.prune(result.run_id)
   end
@@ -338,6 +339,14 @@ defmodule Hancho.HarnessTest do
       ["--config", value] -> [value]
       _pair -> []
     end)
+  end
+
+  defp received_events(batches \\ []) do
+    receive do
+      {:events, events} -> received_events([events | batches])
+    after
+      0 -> batches |> Enum.reverse() |> List.flatten()
+    end
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:jido_harness, key)

@@ -6,6 +6,8 @@ defmodule Hancho.ProviderContractTest do
 
   @providers [:amp, :claude, :codex, :gemini, :grok, :kimi, :opencode, :pi, :zai]
   @capabilities Hancho.ProviderContractFixtures.capabilities()
+  @reasoning_efforts [:low, :medium, :high, :xhigh]
+  @sandbox_modes [:default, :read_only, :workspace_write, :unrestricted]
 
   @options %{
     amp: %{model?: false, reasoning: [:low, :medium, :high], extra_args?: false},
@@ -17,6 +19,30 @@ defmodule Hancho.ProviderContractTest do
     opencode: %{model?: true, reasoning: [:low, :medium, :high], extra_args?: true},
     pi: %{model?: true, reasoning: [:low, :medium, :high], extra_args?: true},
     zai: %{model?: true, reasoning: [:low, :medium, :high], extra_args?: false}
+  }
+
+  @sandbox_support %{
+    amp: [:default],
+    claude: @sandbox_modes,
+    codex: @sandbox_modes,
+    gemini: @sandbox_modes,
+    grok: @sandbox_modes,
+    kimi: [:default],
+    opencode: [:default],
+    pi: [:default, :read_only, :unrestricted],
+    zai: @sandbox_modes
+  }
+
+  @execution_defaults %{
+    amp: {:default, :default},
+    claude: {:auto_edit, :workspace_write},
+    codex: {:auto_edit, :workspace_write},
+    gemini: {:auto_edit, :workspace_write},
+    grok: {:auto_approve, :workspace_write},
+    kimi: {:default, :default},
+    opencode: {:auto_approve, :default},
+    pi: {:auto_approve, :default},
+    zai: {:auto_edit, :workspace_write}
   }
 
   @usage_scopes %{
@@ -128,19 +154,23 @@ defmodule Hancho.ProviderContractTest do
 
       assert_resolution(provider, %{model: "fixture-model"}, expected_options.model?, :model)
 
-      assert_resolution(
-        provider,
-        %{reasoning_effort: :low},
-        :low in expected_options.reasoning,
-        :reasoning_effort
-      )
+      for effort <- @reasoning_efforts do
+        assert_resolution(
+          provider,
+          %{reasoning_effort: effort},
+          effort in expected_options.reasoning,
+          :reasoning_effort
+        )
+      end
 
-      assert_resolution(
-        provider,
-        %{reasoning_effort: :xhigh},
-        :xhigh in expected_options.reasoning,
-        :reasoning_effort
-      )
+      for mode <- @sandbox_modes do
+        assert_resolution(
+          provider,
+          %{sandbox_mode: mode},
+          mode in Map.fetch!(@sandbox_support, provider),
+          :sandbox_mode
+        )
+      end
 
       assert_resolution(
         provider,
@@ -154,11 +184,12 @@ defmodule Hancho.ProviderContractTest do
       provider = unquote(provider)
       provider_name = Atom.to_string(provider)
       expected = options(provider)
+      directory = temporary_directory()
 
       params =
         %{
           prompt: "provider contract",
-          worktree_path: "/fixture/worktree",
+          worktree_path: directory,
           provider: provider_name,
           cli: "/fixture/bin/#{provider}",
           timeout_ms: 1_000
@@ -178,11 +209,16 @@ defmodule Hancho.ProviderContractTest do
       assert options[:model] == if(expected.model?, do: "fixture-model")
       assert options[:reasoning_effort] == if(:low in expected.reasoning, do: :low)
 
+      assert {options[:approval_mode], options[:sandbox_mode]} ==
+               Map.fetch!(@execution_defaults, provider)
+
       if expected.extra_args? do
         assert options[:provider_options][:extra_args] == ["--fixture-extra"]
       else
         refute Map.has_key?(options[:provider_options], :extra_args)
       end
+
+      assert_resolved_harness_request(provider, "provider contract", options)
 
       assert result.model == if(expected.model?, do: "fixture-model")
       assert result.usage["scope"] == usage_scope(provider)
@@ -216,6 +252,15 @@ defmodule Hancho.ProviderContractTest do
     assert {:error, "The pi Harness adapter does not support sandbox mode workspace_write."} =
              Hancho.ProviderContract.validate(:pi, %{sandbox_mode: "workspace_write"})
 
+    for provider <- [:grok, :kimi, :opencode, :pi] do
+      assert {:error, message} =
+               Hancho.ProviderContract.validate(provider, %{extra_args: ["--model"]})
+
+      assert message ==
+               "The #{provider} Harness adapter does not allow extra argument \"--model\" " <>
+                 "because it conflicts with a managed option."
+    end
+
     assert {:error, error} =
              Jido.Exec.run(
                Implement,
@@ -230,6 +275,22 @@ defmodule Hancho.ProviderContractTest do
              )
 
     assert Exception.message(error) =~ "amp Harness adapter does not support model selection"
+    refute_received :unexpected_worktree_prepare
+
+    assert {:error, error} =
+             Jido.Exec.run(
+               Implement,
+               %{
+                 prompt: "provider contract",
+                 worktree_path: "/fixture/worktree",
+                 provider: "grok",
+                 extra_args: ["--model"],
+                 timeout_ms: 1_000
+               },
+               %{services: %{worktree_setup: MustNotPrepareWorktree}, log: :disabled}
+             )
+
+    assert Exception.message(error) =~ "extra argument \"--model\""
     refute_received :unexpected_worktree_prepare
   end
 
@@ -282,6 +343,22 @@ defmodule Hancho.ProviderContractTest do
     end
 
     for provider <- @providers do
+      test "#{provider} reports each normalized authentication state" do
+        provider = unquote(provider)
+
+        for {authenticated, smoke_ready?} <- [
+              {true, true},
+              {false, false},
+              {:unknown, true}
+            ] do
+          put_provider_config(provider, %{authenticated: authenticated, test_pid: self()})
+
+          assert {:ok, status} = Jido.Harness.status(provider)
+          assert status.authenticated == authenticated
+          assert status.smoke_ready == smoke_ready?
+        end
+      end
+
       test "#{provider} normalizes authentication, streaming, tools, usage, errors, and resume" do
         provider = unquote(provider)
         capabilities = capabilities(provider)
@@ -327,8 +404,11 @@ defmodule Hancho.ProviderContractTest do
         assert :tool_result in event_types == capabilities.tool_results?
         assert :thinking_delta in event_types == capabilities.thinking?
         assert result.usage != %{} == capabilities.usage?
-        assert_received {:contract_events, ^provider, events}
-        assert Enum.all?(events, &(&1.provider == provider))
+
+        streamed_events = contract_events(provider)
+        assert Enum.all?(streamed_events, &(&1.provider == provider))
+        assert Enum.map(streamed_events, & &1.sequence) == Enum.map(result.events, & &1.sequence)
+        assert Enum.map(streamed_events, & &1.type) == event_types
 
         assert {:ok, attached} =
                  Hancho.Harness.run_with_progress(
@@ -354,7 +434,9 @@ defmodule Hancho.ProviderContractTest do
                  failed.error
 
         assert failed_run_id == failed.run_id
+        assert failed.error.message == "provider run failed"
         assert failed.error.cause == {:fixture_provider_failure, provider}
+        assert Enum.any?(failed.events, &(&1.type == :run_failed))
         assert :ok = Jido.Harness.Run.prune(failed.run_id)
       end
 
@@ -393,6 +475,13 @@ defmodule Hancho.ProviderContractTest do
         assert %Error{category: :timeout, provider: ^provider, run_id: ^timed_run_id} =
                  timed_out.error
 
+        assert timed_out.error.message == "runtime timeout exceeded"
+        assert timed_out.error.cause == nil
+
+        assert Enum.any?(timed_out.events, fn event ->
+                 event.type == :run_failed and event.payload["timeout"] == "runtime"
+               end)
+
         if capabilities.native_cancel? do
           assert_receive {:provider_contract_cancelled, ^provider, ^timed_run_id}
         else
@@ -417,6 +506,25 @@ defmodule Hancho.ProviderContractTest do
     end
   end
 
+  defp assert_resolved_harness_request(provider, prompt, options) do
+    attributes =
+      options
+      |> Keyword.take([
+        :cwd,
+        :model,
+        :env,
+        :approval_mode,
+        :sandbox_mode,
+        :runtime_timeout_ms,
+        :idle_timeout_ms,
+        :reasoning_effort,
+        :provider_options
+      ])
+      |> Keyword.put(:prompt, prompt)
+
+    assert {:ok, _request} = Jido.Harness.RequestResolver.resolve(provider, attributes)
+  end
+
   defp maybe_put(map, true, key, value), do: Map.put(map, key, value)
   defp maybe_put(map, false, _key, _value), do: map
 
@@ -426,6 +534,24 @@ defmodule Hancho.ProviderContractTest do
 
   defp ordered?(events) do
     Enum.map(events, & &1.sequence) == Enum.to_list(1..length(events))
+  end
+
+  defp contract_events(provider, batches \\ []) do
+    receive do
+      {:contract_events, ^provider, events} -> contract_events(provider, [events | batches])
+    after
+      0 -> batches |> Enum.reverse() |> List.flatten()
+    end
+  end
+
+  defp put_provider_config(provider, config) do
+    provider_config = Application.get_env(:jido_harness, :provider_config, %{}) |> Map.new()
+
+    Application.put_env(
+      :jido_harness,
+      :provider_config,
+      Map.put(provider_config, provider, config)
+    )
   end
 
   defp temporary_directory do
