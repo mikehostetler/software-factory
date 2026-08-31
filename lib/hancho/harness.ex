@@ -187,9 +187,60 @@ defmodule Hancho.Harness do
 
     case Jido.Harness.Run.await(run_id, wait) do
       {:ok, result} ->
+        previous_latest = latest
         {next_cursor, latest, events} = replay(run_id, cursor, latest)
+        now = now()
+
+        {_last_activity_at, _andon_warned?, inactivity_periods, _activity_seen?} =
+          activity_state(
+            events,
+            now,
+            last_activity_at,
+            andon_warned?,
+            andon_warning_ms,
+            previous_latest
+          )
+
+        {last_productive_at, productive_warned?, productive_event_count, last_productive} =
+          productivity_state(
+            events,
+            now,
+            last_productive_at,
+            productive_warned?,
+            productive_event_count,
+            last_productive
+          )
+
+        productive_warn? =
+          not productive_warned? and
+            now - last_productive_at >= productive_warning_ms
 
         with :ok <- notify_events(event_callback, events),
+             :ok <-
+               notify_andon_warnings(
+                 callback,
+                 inactivity_periods,
+                 run_id,
+                 provider,
+                 started_at,
+                 next_cursor,
+                 latest,
+                 andon_warning_ms
+               ),
+             :ok <-
+               maybe_notify_productivity_andon(
+                 callback,
+                 productive_warn?,
+                 run_id,
+                 provider,
+                 started_at,
+                 next_cursor,
+                 latest,
+                 now - last_productive_at,
+                 productive_warning_ms,
+                 productive_event_count,
+                 last_productive
+               ),
              :ok <-
                notify(
                  callback,
@@ -200,13 +251,81 @@ defmodule Hancho.Harness do
 
       {:error, :timeout} ->
         if expired?(deadline) do
-          {:error, :timeout}
-        else
+          previous_latest = latest
           {next_cursor, latest, events} = replay(run_id, cursor, latest)
           now = now()
 
-          {last_activity_at, andon_warned?} =
-            activity_state(events, now, last_activity_at, andon_warned?)
+          {last_activity_at, andon_warned?, inactivity_periods, _activity_seen?} =
+            activity_state(
+              events,
+              now,
+              last_activity_at,
+              andon_warned?,
+              andon_warning_ms,
+              previous_latest
+            )
+
+          {last_productive_at, productive_warned?, productive_event_count, last_productive} =
+            productivity_state(
+              events,
+              now,
+              last_productive_at,
+              productive_warned?,
+              productive_event_count,
+              last_productive
+            )
+
+          warn? = not andon_warned? and now - last_activity_at >= andon_warning_ms
+
+          inactivity_periods =
+            if warn?, do: inactivity_periods ++ [now - last_activity_at], else: inactivity_periods
+
+          productive_warn? =
+            not productive_warned? and
+              now - last_productive_at >= productive_warning_ms
+
+          with :ok <- notify_events(event_callback, events),
+               :ok <-
+                 notify_andon_warnings(
+                   callback,
+                   inactivity_periods,
+                   run_id,
+                   provider,
+                   started_at,
+                   next_cursor,
+                   latest,
+                   andon_warning_ms
+                 ),
+               :ok <-
+                 maybe_notify_productivity_andon(
+                   callback,
+                   productive_warn?,
+                   run_id,
+                   provider,
+                   started_at,
+                   next_cursor,
+                   latest,
+                   now - last_productive_at,
+                   productive_warning_ms,
+                   productive_event_count,
+                   last_productive
+                 ) do
+            {:error, :timeout}
+          end
+        else
+          previous_latest = latest
+          {next_cursor, latest, events} = replay(run_id, cursor, latest)
+          now = now()
+
+          {last_activity_at, andon_warned?, inactivity_periods, activity_seen?} =
+            activity_state(
+              events,
+              now,
+              last_activity_at,
+              andon_warned?,
+              andon_warning_ms,
+              previous_latest
+            )
 
           {last_productive_at, productive_warned?, productive_event_count, last_productive} =
             productivity_state(
@@ -219,7 +338,11 @@ defmodule Hancho.Harness do
             )
 
           warn? =
-            not andon_warned? and now - last_activity_at >= andon_warning_ms
+            activity_seen? and not andon_warned? and
+              now - last_activity_at >= andon_warning_ms
+
+          inactivity_periods =
+            if warn?, do: inactivity_periods ++ [now - last_activity_at], else: inactivity_periods
 
           productive_warn? =
             not productive_warned? and
@@ -227,15 +350,14 @@ defmodule Hancho.Harness do
 
           with :ok <- notify_events(event_callback, events),
                :ok <-
-                 maybe_notify_andon(
+                 notify_andon_warnings(
                    callback,
-                   warn?,
+                   inactivity_periods,
                    run_id,
                    provider,
                    started_at,
                    next_cursor,
                    latest,
-                   now - last_activity_at,
                    andon_warning_ms
                  ),
                :ok <-
@@ -319,16 +441,18 @@ defmodule Hancho.Harness do
   defp configure_journal(provider, journal_dir) do
     with :ok <- File.mkdir_p(journal_dir),
          :ok <- File.chmod(journal_dir, 0o700) do
-      provider_config = Application.get_env(:jido_harness, :provider_config, %{}) |> Map.new()
-      config = provider_config |> Map.get(provider, %{}) |> Map.new()
-      retention = config |> Map.get(:retention, %{}) |> Map.new()
-      config = Map.put(config, :retention, Map.put(retention, :journal_dir, journal_dir))
+      :global.trans({__MODULE__, :journal_configuration}, fn ->
+        provider_config = Application.get_env(:jido_harness, :provider_config, %{}) |> Map.new()
+        config = provider_config |> Map.get(provider, %{}) |> Map.new()
+        retention = config |> Map.get(:retention, %{}) |> Map.new()
+        config = Map.put(config, :retention, Map.put(retention, :journal_dir, journal_dir))
 
-      Application.put_env(
-        :jido_harness,
-        :provider_config,
-        Map.put(provider_config, provider, config)
-      )
+        Application.put_env(
+          :jido_harness,
+          :provider_config,
+          Map.put(provider_config, provider, config)
+        )
+      end)
     end
   end
 
@@ -340,11 +464,49 @@ defmodule Hancho.Harness do
     end
   end
 
-  defp activity_state([], _now, last_activity_at, andon_warned?),
-    do: {last_activity_at, andon_warned?}
+  defp activity_state(
+         events,
+         now,
+         last_activity_at,
+         andon_warned?,
+         andon_warning_ms,
+         previous_latest
+       ) do
+    activity_seen? = activity_event?(previous_latest)
 
-  defp activity_state(_events, now, _last_activity_at, _andon_warned?),
-    do: {now, false}
+    previous_at =
+      if activity_seen?, do: event_time(previous_latest, now), else: last_activity_at
+
+    {_event_at, warning_sent?, inactivity_periods, activity_seen?} =
+      Enum.reduce(
+        events,
+        {previous_at, andon_warned?, [], activity_seen?},
+        fn event, {previous_at, warning_sent?, inactivity_periods, activity_seen?} ->
+          event_at = event_time(event, now)
+          inactivity_ms = max(event_at - previous_at, 0)
+
+          inactivity_periods =
+            if activity_seen? and activity_event?(event) and not warning_sent? and
+                 inactivity_ms >= andon_warning_ms do
+              inactivity_periods ++ [inactivity_ms]
+            else
+              inactivity_periods
+            end
+
+          {event_at, false, inactivity_periods, activity_seen? or activity_event?(event)}
+        end
+      )
+
+    last_activity_at =
+      if Enum.any?(events, &activity_event?/1), do: now, else: last_activity_at
+
+    {last_activity_at, warning_sent?, inactivity_periods, activity_seen?}
+  end
+
+  defp activity_event?(%{type: type}),
+    do: type not in [:run_started, :run_completed, :run_failed, :run_cancelled]
+
+  defp activity_event?(_event), do: false
 
   defp productivity_state(
          events,
@@ -361,9 +523,20 @@ defmodule Hancho.Harness do
         {last_productive_at, productive_warned?, productive_event_count, last_productive}
 
       event ->
-        {now, false, productive_event_count + length(productive), event.type}
+        {event_time(event, now), false, productive_event_count + length(productive), event.type}
     end
   end
+
+  defp event_time(%{timestamp: timestamp}, now) when is_binary(timestamp) do
+    with {:ok, datetime, _offset} <- DateTime.from_iso8601(timestamp) do
+      age = max(System.system_time(:millisecond) - DateTime.to_unix(datetime, :millisecond), 0)
+      now - age
+    else
+      _error -> now
+    end
+  end
+
+  defp event_time(_event, now), do: now
 
   defp productive_event?(%{type: :file_change}), do: true
 
@@ -384,22 +557,8 @@ defmodule Hancho.Harness do
   defp test_evidence?(_output), do: false
   defp truthy?(value), do: value in [true, "true", 1]
 
-  defp maybe_notify_andon(
-         _callback,
-         false,
-         _run_id,
-         _provider,
-         _started_at,
-         _cursor,
-         _latest,
-         _inactivity_ms,
-         _andon_warning_ms
-       ),
-       do: :ok
-
-  defp maybe_notify_andon(
+  defp notify_andon(
          callback,
-         true,
          run_id,
          provider,
          started_at,
@@ -417,6 +576,33 @@ defmodule Hancho.Harness do
     |> notify(
       Map.merge(progress(run_id, provider, :andon, elapsed(started_at), cursor, latest), details)
     )
+  end
+
+  defp notify_andon_warnings(
+         callback,
+         inactivity_periods,
+         run_id,
+         provider,
+         started_at,
+         cursor,
+         latest,
+         andon_warning_ms
+       ) do
+    Enum.reduce_while(inactivity_periods, :ok, fn inactivity_ms, :ok ->
+      case notify_andon(
+             callback,
+             run_id,
+             provider,
+             started_at,
+             cursor,
+             latest,
+             inactivity_ms,
+             andon_warning_ms
+           ) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp maybe_notify_productivity_andon(

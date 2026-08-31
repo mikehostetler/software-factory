@@ -51,6 +51,12 @@ defmodule Hancho.Git do
   @spec show(String.t(), [option()]) :: {:ok, Git.ShowResult.t()} | {:error, term()}
   def show(ref, options \\ []), do: Git.show(ref: ref, config: config(options))
 
+  @spec diff([option() | {:ref, String.t()}]) :: {:ok, Git.Diff.t()} | {:error, term()}
+  def diff(options \\ []) do
+    {diff_options, config_options} = Keyword.split(options, [:ref])
+    Git.diff(Keyword.put(diff_options, :config, config(config_options)))
+  end
+
   @spec worktrees([option()]) :: {:ok, [Git.Worktree.t()]} | {:error, term()}
   def worktrees(options \\ []), do: Git.worktree(config: config(options))
 

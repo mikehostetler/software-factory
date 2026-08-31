@@ -126,6 +126,20 @@ defmodule Hancho.CLITest do
     end
   end
 
+  defmodule MatrixAPI do
+    def run(project, prompt, cells, options) do
+      send(self(), {:matrix_run, project, prompt, cells, options})
+
+      {:ok,
+       %{
+         "schema_version" => 1,
+         "matrix_run_id" => "matrix-cli",
+         "status" => "completed",
+         "runs" => []
+       }}
+    end
+  end
+
   defmodule SummaryQueueRunner do
     def run(_project, "implement", "beadwork-ready", 2, _options) do
       Hancho.Workflow.QueueResult.new(%{
@@ -448,6 +462,53 @@ defmodule Hancho.CLITest do
     assert output == "Queue queue-1 started.\n"
     assert_received {:queue_input, project, true}
     assert project.root == "/repo"
+  end
+
+  test "runs a matrix task and prints JSON" do
+    output =
+      capture_io(fn ->
+        assert Hancho.CLI.run(
+                 [
+                   "matrix-run",
+                   "--task",
+                   "Test the local cart.",
+                   "--cell",
+                   "codex=gpt-a",
+                   "--cell",
+                   "claude=sonnet",
+                   "--concurrency",
+                   "2",
+                   "--max-tokens",
+                   "500",
+                   "--json"
+                 ],
+                 cwd: "/repo",
+                 project_api: ProjectAPI,
+                 matrix_api: MatrixAPI
+               ) == 0
+      end)
+
+    assert Jason.decode!(output)["matrix_run_id"] == "matrix-cli"
+
+    assert_received {:matrix_run, project, "Test the local cart.",
+                     ["codex=gpt-a", "claude=sonnet"], options}
+
+    assert project.root == "/repo"
+    assert options[:concurrency] == 2
+    assert options[:max_tokens] == 500
+  end
+
+  test "requires one matrix task source" do
+    output =
+      capture_io(:stderr, fn ->
+        assert Hancho.CLI.run(["matrix-run", "--cell", "codex=gpt-a"],
+                 cwd: "/repo",
+                 project_api: ProjectAPI,
+                 matrix_api: MatrixAPI
+               ) == 2
+      end)
+
+    assert output == "ERROR: Matrix run requires --task or --task-file.\n"
   end
 
   test "prints normalized queue time, model, and usage summaries" do

@@ -38,6 +38,12 @@ it moves to the next step.
 saved order. It owns queue recovery, repository checks at child boundaries,
 progress reports, and queue forensics.
 
+`Hancho.MatrixRun` is a separate, non-workflow comparison path. It takes the
+factory lease, records one clean commit, creates one detached worktree for each
+selected Harness cell, and runs cells in bounded concurrent batches. It keeps
+cell evidence and writes JSON and Markdown reports. It does not use Bedrock,
+change the source branch, rank results, or select a winner.
+
 `Hancho.Workflow.Store` is the transaction boundary for run, step, effect,
 repair, queue, role handoff, and human attention records. `Hancho.State.Bedrock` starts the local Bedrock
 cluster and implements the durability barrier.
@@ -53,6 +59,7 @@ cluster and implements the durability barrier.
 | Role-to-role work | Workflow runtime | Bedrock handoff records |
 | Human decisions and answers | Attention action and cockpit | Bedrock attention records |
 | Git and worktree state | Git and filesystem | Reconciled with saved expectations |
+| Matrix worktrees and reports | Matrix runner | `.hancho/matrix-runs/` |
 | Promised scope and acceptance | GitHub Issues | Read through the GitHub adapter |
 | Execution tasks and dependencies | Beadwork | Read and changed through the Beadwork adapter |
 | Cross-system identity | Bidirectional markers | Audited by `Hancho.Demands` |
@@ -81,6 +88,11 @@ shows whether a running item started its child workflow. This avoids a second
 
 - One workflow step runs at a time.
 - One queue child runs at a time.
+- Each matrix cell starts from the same recorded commit in a different detached
+  worktree.
+- Matrix usage totals contain only provider-reported, run-scoped additive
+  values.
+- A matrix comparison does not select a winner when evidence is incomplete.
 - Role handoffs do not enable parallel execution.
 - A typed artifact is valid before it becomes available to a later step.
 - Role prompt files are embedded in the durable workflow snapshot.
