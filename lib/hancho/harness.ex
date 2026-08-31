@@ -85,11 +85,14 @@ defmodule Hancho.Harness do
         end
 
       case result do
-        {:ok, _result} -> result
+        {:ok, _result} ->
+          result
+
         {:error, :timeout} ->
           cancel_after_timeout(run_id, cancellation_timeout, event_callback, resume_cursor, nil)
 
-        {:error, _reason} = error -> cancel_after_error(run_id, cancellation_timeout, error)
+        {:error, _reason} = error ->
+          cancel_after_error(run_id, cancellation_timeout, error)
       end
     end
   end
@@ -363,7 +366,9 @@ defmodule Hancho.Harness do
         next_latest = List.last(events)
 
         if next_cursor > cursor do
-          replay_next(run_id, next_cursor, next_latest, remaining - length(events), [events | pages])
+          replay_next(run_id, next_cursor, next_latest, remaining - length(events), [
+            events | pages
+          ])
         else
           {cursor, latest, pages |> Enum.reverse() |> List.flatten()}
         end
