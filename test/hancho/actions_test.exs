@@ -75,6 +75,67 @@ defmodule Hancho.ActionsTest do
     def prepare(_workspace), do: {:error, :mix_path_not_writable}
   end
 
+  defmodule IntendedEffectStore do
+    def begin_effect(owner, _run_id, _position, _key, _kind, _intent) do
+      send(owner, :effect_intent_checked)
+      {:ok, %{"status" => "intended"}}
+    end
+
+    def flush(_owner), do: :ok
+
+    def fail_effect(owner, _run_id, _position, _key, reason) do
+      send(owner, {:effect_reconciliation_failed, reason})
+      :ok
+    end
+
+    def complete_effect(_owner, _run_id, _position, _key, _receipt), do: :ok
+  end
+
+  defmodule LandingRaceGit do
+    def start do
+      Agent.start_link(fn -> :before_merge end, name: __MODULE__)
+    end
+
+    def status(_options) do
+      branch = Agent.get(__MODULE__, &if(&1 == :before_merge, do: "main", else: "other"))
+      {:ok, %Git.Status{branch: branch, entries: []}}
+    end
+
+    def head(_options) do
+      head = Agent.get(__MODULE__, &if(&1 == :before_merge, do: "baseline", else: "commit"))
+      {:ok, head}
+    end
+
+    def merge_ff_only(_repository, "commit") do
+      Agent.update(__MODULE__, fn _state -> :after_merge end)
+      {:ok, :done}
+    end
+  end
+
+  defmodule StaleWorktreeGit do
+    def start(path) do
+      Agent.start_link(fn -> path end, name: __MODULE__)
+    end
+
+    def worktrees(_options) do
+      path = Agent.get(__MODULE__, & &1)
+
+      {:ok,
+       [
+         %Git.Worktree{
+           path: path,
+           head: "baseline",
+           detached: true
+         }
+       ]}
+    end
+
+    def remove_worktree(_repository, _path) do
+      send(self(), :unexpected_worktree_remove)
+      {:ok, :done}
+    end
+  end
+
   defmodule MustNotRunHarness do
     def run(_provider, _prompt, _options) do
       send(self(), :unexpected_provider_run)
@@ -663,6 +724,154 @@ defmodule Hancho.ActionsTest do
              )
 
     assert Exception.message(error) =~ "landing branch changed from main to other"
+  end
+
+  test "does not adopt an interrupted worktree that is attached to a branch" do
+    repository = temporary_repository()
+    {:ok, baseline} = Hancho.Git.head(working_dir: repository)
+    path = Path.join([repository, ".hancho", "worktrees", "interrupted-create"])
+    assert :ok = File.mkdir_p(Path.dirname(path))
+    assert {:ok, :done} = Hancho.Git.create_worktree(repository, path, baseline)
+    {_output, 0} = System.cmd("git", ["-C", path, "switch", "-c", "unexpected"])
+
+    assert {:error, error} =
+             Jido.Exec.run(
+               Actions.CreateWorktree,
+               %{repo_path: repository, baseline: baseline, run_id: "interrupted-create"},
+               effect_context(Hancho.Git),
+               max_retries: 0
+             )
+
+    assert Exception.message(error) =~ "filesystem_out_of_sync"
+    assert Exception.message(error) =~ "worktree_detached"
+    assert_received :effect_intent_checked
+    assert_received {:effect_reconciliation_failed, %{field: "worktree_detached"}}
+    assert {:ok, %Git.Status{branch: "unexpected"}} = Hancho.Git.status(working_dir: path)
+  end
+
+  test "does not commit an agent change on an attached worktree branch" do
+    repository = temporary_repository()
+    {:ok, baseline} = Hancho.Git.head(working_dir: repository)
+    path = Path.join([repository, ".hancho", "worktrees", "attached-commit"])
+    assert :ok = File.mkdir_p(Path.dirname(path))
+    assert {:ok, :done} = Hancho.Git.create_worktree(repository, path, baseline)
+    {_output, 0} = System.cmd("git", ["-C", path, "switch", "-c", "unexpected-commit"])
+    assert :ok = File.write(Path.join(path, "feature.txt"), "uncommitted\n")
+
+    assert {:error, error} =
+             Jido.Exec.run(
+               Actions.Commit,
+               %{
+                 worktree_path: path,
+                 baseline: baseline,
+                 issue: %{"id" => "hancho-branch", "title" => "Branch safety"}
+               },
+               %{services: %{git: Hancho.Git}},
+               max_retries: 0
+             )
+
+    assert Exception.message(error) =~ "filesystem_out_of_sync"
+    assert Exception.message(error) =~ "worktree_branch"
+    assert {:ok, ^baseline} = Hancho.Git.head(working_dir: path)
+    assert File.exists?(Path.join(path, "feature.txt"))
+  end
+
+  test "reports a branch switch that happens during landing" do
+    assert {:ok, race} = LandingRaceGit.start()
+
+    assert {:error, error} =
+             Jido.Exec.run(
+               Actions.Land,
+               %{
+                 repo_path: "/factory",
+                 branch: "main",
+                 baseline: "baseline",
+                 commit: "commit"
+               },
+               %{services: %{git: LandingRaceGit}},
+               max_retries: 0
+             )
+
+    assert Exception.message(error) =~ "landing branch changed from main to other"
+    assert Agent.get(race, & &1) == :after_merge
+  end
+
+  test "does not accept a removed directory while Git still registers the worktree" do
+    repository = temporary_repository()
+    path = Path.join([repository, ".hancho", "worktrees", "stale-registration"])
+    assert {:ok, _stale} = StaleWorktreeGit.start(path)
+
+    assert {:error, error} =
+             Jido.Exec.run(
+               Actions.RemoveWorktree,
+               %{repo_path: repository, worktree_path: path},
+               effect_context(StaleWorktreeGit),
+               max_retries: 0
+             )
+
+    assert Exception.message(error) =~ "filesystem_out_of_sync"
+    assert Exception.message(error) =~ "worktree_registration"
+    assert_received {:effect_reconciliation_failed, %{field: "worktree_registration"}}
+    refute_received :unexpected_worktree_remove
+  end
+
+  test "does not adopt a symlink to a detached worktree outside Hancho storage" do
+    repository = temporary_repository()
+    {:ok, baseline} = Hancho.Git.head(working_dir: repository)
+
+    external =
+      Path.join(System.tmp_dir!(), "hancho-external-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(external) end)
+    assert {:ok, :done} = Hancho.Git.create_worktree(repository, external, baseline)
+
+    path = Path.join([repository, ".hancho", "worktrees", "symlink-create"])
+    assert :ok = File.mkdir_p(Path.dirname(path))
+    assert :ok = File.ln_s(external, path)
+
+    assert {:error, error} =
+             Jido.Exec.run(
+               Actions.CreateWorktree,
+               %{repo_path: repository, baseline: baseline, run_id: "symlink-create"},
+               effect_context(Hancho.Git),
+               max_retries: 0
+             )
+
+    assert Exception.message(error) =~ "filesystem_out_of_sync"
+    assert Exception.message(error) =~ "worktree_path_type"
+    assert_received :effect_intent_checked
+    assert_received {:effect_reconciliation_failed, %{actual: "symlink"}}
+    assert File.read_link!(path) == external
+  end
+
+  test "does not remove a nested path inside a retained worktree" do
+    repository =
+      Path.join(System.tmp_dir!(), "hancho-remove-safety-#{System.unique_integer([:positive])}")
+
+    path = Path.join([repository, ".hancho", "worktrees", "run", "nested"])
+
+    assert {:error, error} =
+             Jido.Exec.run(
+               Actions.RemoveWorktree,
+               %{repo_path: repository, worktree_path: path},
+               effect_context(Hancho.Git),
+               max_retries: 0
+             )
+
+    assert Exception.message(error) =~ "refused to remove"
+    refute_received :effect_intent_checked
+  end
+
+  defp effect_context(git) do
+    %{
+      services: %{git: git},
+      effect_store: %{
+        api: IntendedEffectStore,
+        store: self(),
+        run_id: "recovery-run",
+        step_position: 0
+      }
+    }
   end
 
   defp temporary_repository do

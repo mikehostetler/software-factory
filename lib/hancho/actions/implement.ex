@@ -276,6 +276,31 @@ defmodule Hancho.Actions.Implement do
     )
   end
 
+  defp write_progress(context, %{phase: :stream_andon} = progress) do
+    {label, event} = stream_andon_activity(context)
+
+    Hancho.Audit.write(
+      context.log,
+      "#{label} Andon: invalid provider event stream",
+      event: event,
+      level: :error,
+      metadata: progress
+    )
+  end
+
+  defp write_progress(context, %{phase: phase} = progress)
+       when phase in [:failed, :cancelled] do
+    {label, event} = terminal_andon_activity(context)
+
+    Hancho.Audit.write(
+      context.log,
+      "#{label} Andon: provider run #{phase}",
+      event: event,
+      level: :error,
+      metadata: progress
+    )
+  end
+
   defp write_progress(context, progress) do
     {label, event} = activity(context)
 
@@ -317,14 +342,18 @@ defmodule Hancho.Actions.Implement do
     case Map.get(context, :effect_store) do
       %{api: api, store: store, run_id: run_id, step_position: position} ->
         if function_exported?(api, :record_step_operation, 6) do
-          api.record_step_operation(
-            store,
-            run_id,
-            position,
-            operation_kind(context),
-            harness_run_id,
-            Map.drop(progress, [:harness_run_id])
-          )
+          with :ok <-
+                 api.record_step_operation(
+                   store,
+                   run_id,
+                   position,
+                   operation_kind(context),
+                   harness_run_id,
+                   Map.drop(progress, [:harness_run_id])
+                 ),
+               :ok <- maybe_flush_operation(api, store, progress) do
+            :ok
+          end
         else
           :ok
         end
@@ -335,6 +364,13 @@ defmodule Hancho.Actions.Implement do
   end
 
   defp persist_harness_run(_context, _progress), do: :ok
+
+  defp maybe_flush_operation(api, store, %{phase: phase})
+       when phase in [:started, :reattached] do
+    if function_exported?(api, :flush, 1), do: api.flush(store), else: :ok
+  end
+
+  defp maybe_flush_operation(_api, _store, _progress), do: :ok
 
   defp verbose_event_options(options, %{verbose: true}) do
     Keyword.merge(options,
@@ -356,6 +392,12 @@ defmodule Hancho.Actions.Implement do
 
   defp productivity_andon_activity(_context),
     do: {"Implementation", "implement.productivity_andon"}
+
+  defp stream_andon_activity(%{activity: :repair}), do: {"Repair", "repair.stream_andon"}
+  defp stream_andon_activity(_context), do: {"Implementation", "implement.stream_andon"}
+
+  defp terminal_andon_activity(%{activity: :repair}), do: {"Repair", "repair.terminal_andon"}
+  defp terminal_andon_activity(_context), do: {"Implementation", "implement.terminal_andon"}
 
   defp andon_duration(milliseconds) when rem(milliseconds, 1_000) == 0,
     do: "#{div(milliseconds, 1_000)} seconds"
@@ -387,7 +429,35 @@ defmodule Hancho.Actions.Implement do
   end
 
   defp completed(%{status: :completed}), do: :ok
-  defp completed(result), do: {:error, result.error || "The coding agent did not complete."}
+
+  defp completed(%{status: :cancelled} = result) do
+    {:error,
+     %{
+       code: "provider_cancelled",
+       harness_run_id: result.run_id,
+       provider: result.provider,
+       error: Hancho.Log.Event.normalize(result.error || "The coding agent run was cancelled.")
+     }}
+  end
+
+  defp completed(%{status: :failed} = result) do
+    {:error,
+     %{
+       code: "provider_failed",
+       harness_run_id: result.run_id,
+       provider: result.provider,
+       error: Hancho.Log.Event.normalize(result.error || "The coding agent run failed.")
+     }}
+  end
+
+  defp completed(result) do
+    {:error,
+     %{
+       code: "provider_incomplete",
+       harness_run_id: Map.get(result, :run_id),
+       error: Hancho.Log.Event.normalize(Map.get(result, :error))
+     }}
+  end
 
   defp tail(text, limit) when byte_size(text) <= limit, do: text
   defp tail(text, limit), do: binary_part(text, byte_size(text) - limit, limit)

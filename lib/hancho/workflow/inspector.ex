@@ -15,6 +15,7 @@ defmodule Hancho.Workflow.Inspector do
   defp inspect_with_store(project, store_api, store, run_id) do
     with {:ok, run} <- store_api.fetch_run(store, run_id),
          {:ok, steps} <- store_api.list_steps(store, run_id),
+         {:ok, effects} <- effects(store_api, store, run_id),
          {:ok, outputs} <- Jason.decode(run["outputs_json"]) do
       artifacts = Artifacts.from_steps(steps, outputs)
 
@@ -27,22 +28,23 @@ defmodule Hancho.Workflow.Inspector do
          started_at: run["started_at"],
          finished_at: run["finished_at"],
          duration_ms: duration(run["started_at"], run["finished_at"]),
-         provider: provider_result(artifacts),
+         provider: provider_result(artifacts, steps),
          verification: verification_result(artifacts),
          commit:
            get_in(artifacts, ["landing", "commit"]) || get_in(artifacts, ["commit", "commit"]),
          retained_worktree: retained_worktree(artifacts),
          forensic_report: forensic_report(project, run_id),
          failure: decode_optional(run["error_json"]),
+         effects: Enum.map(effects, &effect_report/1),
          steps: Enum.map(steps, &step_report/1)
        }}
     end
   end
 
-  defp provider_result(artifacts) do
+  defp provider_result(artifacts, steps) do
     case artifacts["implementation"] do
       nil ->
-        nil
+        provider_operation(steps)
 
       result ->
         Map.take(result, [
@@ -58,6 +60,33 @@ defmodule Hancho.Workflow.Inspector do
           "text",
           "text_truncated"
         ])
+    end
+  end
+
+  defp provider_operation(steps) do
+    steps
+    |> Enum.map(&decode_optional(&1["operation_json"]))
+    |> Enum.find(fn
+      %{"kind" => kind} -> kind in ["jido_harness.run", "jido_harness.repair"]
+      _other -> false
+    end)
+    |> case do
+      %{"id" => id, "metadata" => metadata} = operation ->
+        %{
+          "harness_run_id" => id,
+          "provider" => metadata["provider"],
+          "model" => metadata["configured_model"],
+          "model_source" => metadata["model_source"],
+          "status" => metadata["terminal_status"],
+          "last_event" => metadata["last_event"],
+          "last_sequence" => metadata["last_sequence"],
+          "error" => metadata["error"],
+          "history" => Map.get(operation, "history", [])
+        }
+        |> Map.reject(fn {_key, value} -> is_nil(value) end)
+
+      _other ->
+        nil
     end
   end
 
@@ -103,9 +132,32 @@ defmodule Hancho.Workflow.Inspector do
       started_at: step["started_at"],
       finished_at: step["finished_at"],
       duration_ms: duration(step["started_at"], step["finished_at"]),
+      operation: decode_optional(step["operation_json"]),
       repairs: repair_records(step["repairs_json"]),
       error: decode_optional(step["error_json"])
     }
+  end
+
+  defp effects(store_api, store, run_id) do
+    if function_exported?(store_api, :list_effects, 2),
+      do: store_api.list_effects(store, run_id),
+      else: {:ok, []}
+  end
+
+  defp effect_report(effect) do
+    effect
+    |> Map.take([
+      "step_position",
+      "key",
+      "kind",
+      "status",
+      "attempt",
+      "started_at",
+      "applied_at"
+    ])
+    |> Map.put("intent", decode_optional(effect["intent_json"]))
+    |> Map.put("receipt", decode_optional(effect["receipt_json"]))
+    |> Map.put("error", decode_optional(effect["error_json"]))
   end
 
   defp repair_records(json) do

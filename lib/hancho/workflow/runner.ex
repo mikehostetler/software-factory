@@ -38,7 +38,7 @@ defmodule Hancho.Workflow.Runner do
 
       case flush_store(store_api, store, options) do
         :ok -> result
-        {:error, reason} -> {:error, {:state_flush_failed, reason}}
+        {:error, reason} -> state_flush_error(result, reason)
       end
     end
   end
@@ -61,7 +61,7 @@ defmodule Hancho.Workflow.Runner do
 
       case flush_store(store_api, store, options) do
         :ok -> result
-        {:error, reason} -> {:error, {:state_flush_failed, reason}}
+        {:error, reason} -> state_flush_error(result, reason)
       end
     end
   end
@@ -74,7 +74,7 @@ defmodule Hancho.Workflow.Runner do
       with :ok <- store_api.create_run(store, run_id, definition, input, workflow_source),
            :ok <- log_workflow_source(log, definition, workflow_source),
            {:ok, result} <- run_runtime(definition, input, run_id, store, log, options) do
-        {:ok, attach_failure_evidence(project, result, options)}
+        {:ok, attach_failure_evidence(project, result, store, options)}
       end
     end)
   end
@@ -90,28 +90,108 @@ defmodule Hancho.Workflow.Runner do
          {:ok, input} <- Jason.decode(run["input_json"]),
          {:ok, _compiled} <- compiler.compile(project, definition, input, options),
          {:ok, steps} <- store_api.list_steps(store, run_id),
-         {:ok, recovery} <- recovery_action(steps),
+         {:ok, recovery} <- recovery_action(steps, definition),
          {:ok, outputs} <- completed_outputs(steps),
-         {:ok, repairs} <- Repair.from_steps(steps),
-         {:ok, _summary} <-
-           reconciler.retry(
+         {:ok, repairs} <- Repair.from_steps(steps) do
+      case reconciler.retry(
              project,
              outputs,
              Keyword.put(reconcile_options(options), :definition, definition)
            ) do
-      recover_run(
-        project,
-        definition,
-        input,
-        run_id,
-        store,
-        outputs,
-        repairs,
-        recovery,
-        options
-      )
+        {:ok, _summary} ->
+          recover_run(
+            project,
+            definition,
+            input,
+            run_id,
+            store,
+            outputs,
+            repairs,
+            recovery,
+            options
+          )
+
+        {:error, reason} ->
+          reconciliation_failure(
+            project,
+            run,
+            definition,
+            outputs,
+            repairs,
+            recovery,
+            store,
+            reason,
+            options
+          )
+      end
     end
   end
+
+  defp reconciliation_failure(
+         project,
+         run,
+         definition,
+         outputs,
+         repairs,
+         recovery,
+         store,
+         reason,
+         options
+       ) do
+    run_id = run["id"]
+    step = recovery_step(run, definition, recovery)
+
+    error = %{
+      code: "recovery_reconciliation_failed",
+      step: step,
+      error: Hancho.Log.Event.normalize(reason)
+    }
+
+    store_api = Keyword.get(options, :store_api, Store)
+    artifacts = definition |> Artifacts.from_outputs(outputs) |> put_repairs(repairs)
+
+    with_audit_log(project, run_id, options, fn log ->
+      with :ok <- persist_recovery_andon(store_api, store, run_id, recovery, step, error),
+           :ok <-
+             Hancho.Audit.write(log, "Workflow recovery Andon: repository state is not safe",
+               event: "workflow.recovery_andon",
+               level: :error,
+               metadata: error
+             ),
+           {:ok, result} <-
+             Result.new(%{
+               run_id: run_id,
+               workflow: definition.name,
+               status: :stopped,
+               current_step: step,
+               outputs: outputs,
+               artifacts: artifacts,
+               error: error
+             }) do
+        {:ok, attach_failure_evidence(project, result, store, options)}
+      end
+    end)
+  end
+
+  defp persist_recovery_andon(store_api, store, run_id, {:retry, position}, step, error) do
+    store_api.mark_recovery_required(store, run_id, position, step, error)
+  end
+
+  defp persist_recovery_andon(store_api, store, run_id, {:start, _position}, step, error) do
+    store_api.mark_run_recovery_required(store, run_id, step, error)
+  end
+
+  defp persist_recovery_andon(store_api, store, run_id, :finalize, step, error) do
+    store_api.mark_run_recovery_required(store, run_id, step, error)
+  end
+
+  defp recovery_step(_run, definition, {:retry, position}),
+    do: Enum.at(definition.steps, position).name
+
+  defp recovery_step(_run, definition, {:start, position}),
+    do: Enum.at(definition.steps, position).name
+
+  defp recovery_step(run, _definition, :finalize), do: run["current_step"]
 
   defp recover_run(
          project,
@@ -140,7 +220,40 @@ defmodule Hancho.Workflow.Runner do
                artifacts: definition |> Artifacts.from_outputs(outputs) |> put_repairs(repairs),
                repairs: repairs
              }) do
-        {:ok, attach_failure_evidence(project, result, options)}
+        {:ok, attach_failure_evidence(project, result, store, options)}
+      end
+    end)
+  end
+
+  defp recover_run(
+         project,
+         definition,
+         input,
+         run_id,
+         store,
+         outputs,
+         repairs,
+         {:start, position},
+         options
+       ) do
+    store_api = Keyword.get(options, :store_api, Store)
+    step = Enum.at(definition.steps, position)
+
+    with_audit_log(project, run_id, options, fn log ->
+      with :ok <- store_api.resume_run(store, run_id, step.name),
+           :ok <-
+             Hancho.Audit.write(log, "Workflow retry started",
+               event: "workflow.retry_started",
+               metadata: %{step: step.name, recovery: "start_missing_step"}
+             ),
+           {:ok, result} <-
+             run_runtime(definition, input, run_id, store, log, options, %{
+               index: position,
+               outputs: outputs,
+               artifacts: definition |> Artifacts.from_outputs(outputs) |> put_repairs(repairs),
+               repairs: repairs
+             }) do
+        {:ok, attach_failure_evidence(project, result, store, options)}
       end
     end)
   end
@@ -175,7 +288,7 @@ defmodule Hancho.Workflow.Runner do
                artifacts: artifacts,
                error: nil
              }) do
-        {:ok, attach_failure_evidence(project, result, options)}
+        {:ok, attach_failure_evidence(project, result, store, options)}
       end
     end)
   end
@@ -231,6 +344,29 @@ defmodule Hancho.Workflow.Runner do
     end
   end
 
+  defp state_flush_error({:ok, result}, reason) do
+    {:error,
+     %{
+       code: "state_flush_failed",
+       run_id: result.run_id,
+       status: result.status,
+       current_step: result.current_step,
+       error: Hancho.Log.Event.normalize(result.error),
+       cleanup: Hancho.Log.Event.normalize(result.cleanup),
+       forensic_report: result.forensic_report,
+       flush_error: Hancho.Log.Event.normalize(reason)
+     }}
+  end
+
+  defp state_flush_error(result, reason) do
+    {:error,
+     %{
+       code: "state_flush_failed",
+       result: Hancho.Log.Event.normalize(result),
+       flush_error: Hancho.Log.Event.normalize(reason)
+     }}
+  end
+
   defp resumable_run(%{"status" => status})
        when status in ["stopped", "running", "recovery_required"],
        do: :ok
@@ -249,20 +385,42 @@ defmodule Hancho.Workflow.Runner do
     error -> {:error, Exception.message(error)}
   end
 
-  defp recovery_action(steps) do
-    case Enum.find(steps, &(&1["status"] in ["stopped", "running", "recovery_required"])) do
-      nil -> completed_recovery(steps)
-      step -> {:ok, {:retry, step["position"]}}
+  defp recovery_action(steps, definition) do
+    with :ok <- validate_recovery_steps(steps, definition) do
+      case Enum.find(steps, &(&1["status"] != "completed")) do
+        nil -> completed_recovery(steps, definition)
+        step -> {:ok, {:retry, step["position"]}}
+      end
     end
   end
 
-  defp completed_recovery([]), do: {:error, :resumable_step_not_found}
-
-  defp completed_recovery(steps) do
-    if Enum.all?(steps, &(&1["status"] == "completed")) do
+  defp completed_recovery(steps, definition) do
+    if length(steps) == length(definition.steps) do
       {:ok, :finalize}
     else
-      {:error, :resumable_step_not_found}
+      {:ok, {:start, length(steps)}}
+    end
+  end
+
+  defp validate_recovery_steps(steps, definition) do
+    invalid =
+      steps
+      |> Enum.with_index()
+      |> Enum.find(fn {saved, position} ->
+        case Enum.at(definition.steps, position) do
+          nil ->
+            true
+
+          expected ->
+            saved["position"] != position or saved["name"] != expected.name or
+              saved["action"] != expected.action or
+              (saved["status"] != "completed" and position != length(steps) - 1)
+        end
+      end)
+
+    case invalid do
+      nil -> :ok
+      {step, position} -> {:error, {:invalid_recovery_step, position, step}}
     end
   end
 
@@ -289,9 +447,78 @@ defmodule Hancho.Workflow.Runner do
     %{result | cleanup: cleanup_api.run(project, result, options)}
   end
 
-  defp attach_failure_evidence(project, result, options) do
+  defp attach_failure_evidence(project, result, store, options) do
+    result = attach_durable_evidence(result, store, options)
     result = attach_cleanup(project, result, options)
     attach_forensics(result, project, options)
+  end
+
+  defp attach_durable_evidence(result, store, options) do
+    store_api = Keyword.get(options, :store_api, Store)
+
+    operations =
+      case store_api.list_steps(store, result.run_id) do
+        {:ok, steps} -> Enum.flat_map(steps, &step_operation/1)
+        {:error, _reason} -> []
+      end
+
+    effects =
+      if function_exported?(store_api, :list_effects, 2) do
+        case store_api.list_effects(store, result.run_id) do
+          {:ok, records} -> Enum.map(records, &effect_evidence/1)
+          {:error, _reason} -> []
+        end
+      else
+        []
+      end
+
+    if operations == [] and effects == [] do
+      result
+    else
+      evidence = %{"operations" => operations, "effects" => effects}
+      %{result | artifacts: Map.put(result.artifacts, "recovery_evidence", evidence)}
+    end
+  end
+
+  defp step_operation(%{"operation_json" => json} = step) when is_binary(json) do
+    case Jason.decode(json) do
+      {:ok, operation} when is_map(operation) ->
+        [
+          operation
+          |> Map.put("step", step["name"])
+          |> Map.put("step_position", step["position"])
+        ]
+
+      _invalid ->
+        []
+    end
+  end
+
+  defp step_operation(_step), do: []
+
+  defp effect_evidence(effect) do
+    effect
+    |> Map.take([
+      "step_position",
+      "key",
+      "kind",
+      "status",
+      "attempt",
+      "started_at",
+      "applied_at"
+    ])
+    |> Map.put("intent", decode_evidence(effect["intent_json"]))
+    |> Map.put("receipt", decode_evidence(effect["receipt_json"]))
+    |> Map.put("error", decode_evidence(effect["error_json"]))
+  end
+
+  defp decode_evidence(nil), do: nil
+
+  defp decode_evidence(json) do
+    case Jason.decode(json) do
+      {:ok, value} -> value
+      {:error, _reason} -> %{"invalid_json" => true}
+    end
   end
 
   defp attach_forensics(%{status: :stopped} = result, project, options) do

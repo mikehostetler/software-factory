@@ -92,6 +92,18 @@ defmodule Hancho.WorkflowTest do
     end
   end
 
+  defmodule FailingRetryReconciler do
+    def retry(_project, _outputs, _options) do
+      {:error,
+       %{
+         code: "filesystem_out_of_sync",
+         field: "repository_status",
+         expected: "clean",
+         actual: [%{path: "unexpected.txt"}]
+       }}
+    end
+  end
+
   defmodule RecordingFailureCleanup do
     def run(project, result, options) do
       send(options[:test_pid], {:failure_cleanup, project.root, result.current_step})
@@ -412,6 +424,130 @@ defmodule Hancho.WorkflowTest do
     assert {:ok, steps} = Store.list_steps(store, "run-retry")
     assert Enum.map(steps, & &1["status"]) == ["completed", "completed"]
     Store.flush(store)
+  end
+
+  test "persists a recovery Andon when retry reconciliation fails" do
+    {project, _workflow_path} = project_with_workflow(successful_workflow())
+
+    assert {:ok, stopped} =
+             Runner.run(project, "test", %{"number" => 3},
+               run_id: "run-recovery-andon",
+               registry: Registry,
+               executor: TransientExecutor,
+               services: %{test_pid: self()},
+               log: :disabled,
+               flush_state: false
+             )
+
+    assert stopped.status == :stopped
+    assert_received :first_executed
+    assert_received :second_executed
+
+    assert {:ok, recovery} =
+             Runner.retry(project, "run-recovery-andon",
+               registry: Registry,
+               executor: TransientExecutor,
+               services: %{test_pid: self()},
+               reconciler: FailingRetryReconciler,
+               log: :disabled,
+               flush_state: false
+             )
+
+    assert recovery.status == :stopped
+    assert recovery.current_step == "second"
+    assert recovery.error.code == "recovery_reconciliation_failed"
+    assert recovery.error.error["code"] == "filesystem_out_of_sync"
+    assert File.regular?(recovery.forensic_report)
+    refute_received :second_executed
+
+    assert {:ok, store} = Store.open(project.bedrock_path)
+    assert {:ok, run} = Store.fetch_run(store, "run-recovery-andon")
+    assert run["status"] == "recovery_required"
+    assert Jason.decode!(run["error_json"])["code"] == "recovery_reconciliation_failed"
+
+    assert {:ok, steps} = Store.list_steps(store, "run-recovery-andon")
+    assert Enum.map(steps, & &1["status"]) == ["completed", "recovery_required"]
+    assert :ok = Store.flush(store)
+  end
+
+  test "starts the next step after a crash between sequential steps" do
+    {project, _workflow_path} = project_with_workflow(successful_workflow())
+    assert {:ok, definition, source} = Loader.load_with_source(project, "test")
+    assert {:ok, store} = Store.open(project.bedrock_path)
+
+    assert :ok =
+             Store.create_run(store, "run-between-steps", definition, %{"number" => 3}, source)
+
+    assert :ok = Store.start_step(store, "run-between-steps", 0, hd(definition.steps), %{})
+
+    assert :ok =
+             Store.complete_step(store, "run-between-steps", 0, %{"value" => 4}, %{
+               "first" => %{"value" => 4}
+             })
+
+    assert :ok = Store.flush(store)
+
+    assert {:ok, completed} =
+             Runner.retry(project, "run-between-steps",
+               registry: Registry,
+               executor: TransientExecutor,
+               services: %{test_pid: self()},
+               reconciler: RetryReconciler,
+               log: :disabled,
+               flush_state: false
+             )
+
+    assert completed.status == :completed
+    assert completed.outputs["second"] == %{"value" => 8}
+    refute_received :first_executed
+    assert_received :second_executed
+
+    assert {:ok, steps} = Store.list_steps(store, "run-between-steps")
+    assert Enum.map(steps, & &1["status"]) == ["completed", "completed"]
+    assert :ok = Store.flush(store)
+  end
+
+  test "retries an idempotent retry_pending transition after a crash" do
+    {project, _workflow_path} = project_with_workflow(successful_workflow())
+    assert {:ok, definition, source} = Loader.load_with_source(project, "test")
+    assert {:ok, store} = Store.open(project.bedrock_path)
+
+    assert :ok =
+             Store.create_run(store, "run-retry-pending", definition, %{"number" => 3}, source)
+
+    assert :ok = Store.start_step(store, "run-retry-pending", 0, hd(definition.steps), %{})
+
+    assert :ok =
+             Store.stop_run_and_step(
+               store,
+               "run-retry-pending",
+               0,
+               "first",
+               :interrupted
+             )
+
+    assert :ok = Store.retry_run(store, "run-retry-pending", 0)
+    assert :ok = Store.flush(store)
+
+    assert {:ok, completed} =
+             Runner.retry(project, "run-retry-pending",
+               registry: Registry,
+               executor: Executor,
+               reconciler: RetryReconciler,
+               log: :disabled,
+               flush_state: false
+             )
+
+    assert completed.status == :completed
+
+    assert completed.outputs == %{
+             "first" => %{"value" => 4},
+             "second" => %{"value" => 8}
+           }
+
+    assert {:ok, steps} = Store.list_steps(store, "run-retry-pending")
+    assert Enum.map(steps, & &1["status"]) == ["completed", "completed"]
+    assert :ok = Store.flush(store)
   end
 
   test "repairs an approved gate failure and retries only that gate" do
