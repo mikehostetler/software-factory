@@ -501,7 +501,9 @@ Run one task through selected Harness provider and model combinations:
 
 Use one `--cell PROVIDER=MODEL` option for each requested model. Omit `=MODEL`
 to use the provider default. Use `--task "..."` for a short task. Use only one
-of `--task` and `--task-file`.
+of `--task` and `--task-file`. The pinned Amp adapter does not support an
+explicit model. The pinned Gemini adapter does not support a reasoning-effort
+option.
 
 Hancho requires a clean repository and takes the factory lease. It records the
 current commit. It creates one detached Git worktree for each cell at
@@ -535,16 +537,22 @@ Each cell report includes the provider, requested model, effective model when a
 normalized start event contains it, Harness run ID, provider session ID,
 bounded output, tool calls and results, Git file status, a tracked-file patch,
 test command evidence, timing, usage, cost, and failure data. Untracked paths
-are listed, but the patch has tracked changes only. Harness journals, patches,
-`report.json`, and `comparison.md` stay under the matrix run directory. The
-worktrees stay registered and available for inspection. Matrix reports can
+are listed with content hashes, but the patch has tracked changes only. A Git
+status or diff error makes the comparison evidence incomplete. Harness journals,
+patches, `report.json`, and `comparison.md` stay under the matrix run directory.
+The worktrees stay registered and available for inspection. Matrix reports can
 contain the task, model output, tool input, command output, and source changes.
-Keep `.hancho/` private.
+Hancho redacts sensitive keys, Bearer values, and secret values from the process
+environment before it writes report and patch artifacts. This filter is a
+defense in depth measure. Keep `.hancho/` private.
 
-The comparison groups different outputs and file changes. It also shows model,
-test, timing, usage, cost, and status differences. It marks missing effective
-model, usage, output, or cell data as incomplete. It does not rank cells and
-does not select a winner from incomplete evidence.
+The comparison groups different outputs and file changes. It also shows
+requested model, provider-reported effective model, whether those two values
+match, test, timing, usage, cost, and status differences. A configured model is
+only a request. Hancho does not call it the effective model unless a normalized
+provider start event reports that value. It marks missing effective model,
+usage, output, or cell data as incomplete. It does not rank cells and does not
+select a winner from incomplete evidence.
 
 Add `--json` to write the complete report to standard output as JSON. Hancho
 still saves the JSON and Markdown files:
@@ -558,16 +566,17 @@ For a local agentic-commerce fixture, add a loopback origin:
 
 ```sh
 ./hancho matrix-run --task-file cart-test.md \
-  --cell codex=gpt-5.6-codex \
+  --cell claude=claude-sonnet-4-6 \
   --local-server http://127.0.0.1:4000
 ```
 
 The value must be an HTTP or HTTPS origin on `localhost`, `127.0.0.1`, or
 `::1`. It cannot contain credentials, a path, a query, or a fragment. Hancho
 adds task rules that prohibit real purchases, real financial transactions, and
-production commerce services. It enables the Codex workspace network option
-for this mode. It gives Claude-compatible adapters a loopback host setting.
-Other adapters keep their normal network setting.
+production commerce services. Local-server mode accepts only the Claude and
+Z.AI adapters because their sandbox has an enforced host allowlist. Hancho
+rejects Codex and the other adapters in this mode because their pinned Harness
+adapters cannot limit network access to one loopback host.
 
 Local-server evidence comes from normalized Harness tool and command events
 that contain the exact origin. This proves only that the agent-side event

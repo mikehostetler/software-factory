@@ -9,6 +9,7 @@ defmodule Hancho.MatrixRun do
   @default_max_tasks 20
   @reasoning_efforts ["low", "medium", "high", "xhigh"]
   @loopback_hosts ["localhost", "127.0.0.1", "::1"]
+  @local_server_providers [:claude, :zai]
 
   @type option ::
           {:concurrency, pos_integer()}
@@ -42,7 +43,9 @@ defmodule Hancho.MatrixRun do
          {:ok, cells} <- parse_cells(cell_specifications),
          :ok <- validate_cells(cells, settings),
          {:ok, local_server} <- validate_local_server(settings.local_server),
+         :ok <- validate_models(cells),
          :ok <- validate_reasoning(cells, settings.reasoning_effort),
+         :ok <- validate_local_server_cells(cells, local_server),
          {:ok, baseline} <- baseline(project, settings.git),
          {:ok, matrix_run_id} <- resolve_matrix_run_id(options),
          root = Path.join([project.hancho_dir, "matrix-runs", matrix_run_id]),
@@ -140,7 +143,11 @@ defmodule Hancho.MatrixRun do
   end
 
   defp validate_prompt(prompt) when is_binary(prompt) do
-    if String.trim(prompt) == "", do: validation("The matrix task must not be empty."), else: :ok
+    cond do
+      not String.valid?(prompt) -> validation("The matrix task must be valid UTF-8 text.")
+      String.trim(prompt) == "" -> validation("The matrix task must not be empty.")
+      true -> :ok
+    end
   end
 
   defp validate_prompt(_prompt), do: validation("The matrix task must be text.")
@@ -166,6 +173,18 @@ defmodule Hancho.MatrixRun do
     end
   end
 
+  defp validate_models(cells) do
+    case Enum.find(cells, &(&1.provider == :amp and is_binary(&1.requested_model))) do
+      nil ->
+        :ok
+
+      cell ->
+        validation(
+          "The Amp Harness adapter does not support an explicit model for cell #{cell.id}."
+        )
+    end
+  end
+
   defp validate_reasoning(cells, "xhigh") do
     if Enum.all?(cells, &(&1.provider in [:codex, :grok])) do
       :ok
@@ -174,7 +193,34 @@ defmodule Hancho.MatrixRun do
     end
   end
 
+  defp validate_reasoning(cells, reasoning) when is_binary(reasoning) do
+    if Enum.any?(cells, &(&1.provider == :gemini)) do
+      validation("The Gemini Harness adapter does not support a reasoning effort.")
+    else
+      :ok
+    end
+  end
+
   defp validate_reasoning(_cells, _reasoning), do: :ok
+
+  defp validate_local_server_cells(_cells, nil), do: :ok
+
+  defp validate_local_server_cells(cells, _local_server) do
+    unsupported = Enum.reject(cells, &(&1.provider in @local_server_providers))
+
+    case unsupported do
+      [] ->
+        :ok
+
+      values ->
+        providers = values |> Enum.map(& &1.provider_name) |> Enum.uniq() |> Enum.join(", ")
+
+        validation(
+          "Local-server mode requires an enforced loopback host allowlist. " <>
+            "Unsupported providers: #{providers}. Use Claude or Z.AI cells."
+        )
+    end
+  end
 
   defp validate_local_server(nil), do: {:ok, nil}
 
@@ -226,11 +272,21 @@ defmodule Hancho.MatrixRun do
   end
 
   defp prepare_root(root) do
-    with :ok <- File.mkdir_p(Path.join(root, "worktrees")),
+    with :ok <- File.mkdir_p(Path.dirname(root)),
+         :ok <- create_run_root(root),
+         :ok <- File.mkdir(Path.join(root, "worktrees")),
          :ok <- File.mkdir_p(Path.join(root, "patches")),
          :ok <- File.mkdir_p(Path.join(root, "journals")),
          :ok <- File.chmod(root, 0o700) do
       :ok
+    end
+  end
+
+  defp create_run_root(root) do
+    case File.mkdir(root) do
+      :ok -> :ok
+      {:error, :eexist} -> validation("The matrix run directory already exists: #{root}.")
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -333,15 +389,15 @@ defmodule Hancho.MatrixRun do
          settings,
          started_at
        ) do
-    prepared =
-      Enum.map(cells, fn cell ->
-        prepare_cell(cell, project, baseline, root, settings)
-      end)
+    prepared = prepare_cells(cells, project, baseline, root, settings, started_at)
 
-    failures =
+    not_runnable =
       for {:error, cell, reason, worktree} <- prepared do
         failed_setup_run(cell, worktree, reason)
-      end
+      end ++
+        for {:skipped, cell, reason} <- prepared do
+          skipped_run(cell, reason)
+        end
 
     runnable = for {:ok, prepared_cell} <- prepared, do: prepared_cell
 
@@ -372,8 +428,21 @@ defmodule Hancho.MatrixRun do
           failed_worker_run(prepared_cell, reason, settings.git, root)
       end)
 
-    (failures ++ completed)
+    (not_runnable ++ completed)
     |> Enum.sort_by(& &1["position"])
+  end
+
+  defp prepare_cells(cells, project, baseline, root, settings, started_at) do
+    {prepared, _expired?} =
+      Enum.map_reduce(cells, false, fn cell, expired? ->
+        if expired? or now() - started_at >= settings.max_time_ms do
+          {{:skipped, cell, "max_time_ms"}, true}
+        else
+          {prepare_cell(cell, project, baseline, root, settings), false}
+        end
+      end)
+
+    prepared
   end
 
   defp prepare_cell(cell, project, baseline, root, settings) do
@@ -400,9 +469,40 @@ defmodule Hancho.MatrixRun do
   end
 
   defp run_cell(prepared, prompt, matrix_run_id, root, local_server, settings, started_at) do
-    started = DateTime.utc_now()
     started_monotonic = now()
-    remaining = max(settings.max_time_ms - (started_monotonic - started_at), 1)
+    remaining = settings.max_time_ms - (started_monotonic - started_at)
+
+    if remaining <= 0 do
+      skipped_prepared_run(prepared, "max_time_ms", root)
+    else
+      do_run_cell(
+        prepared,
+        prompt,
+        matrix_run_id,
+        root,
+        local_server,
+        settings,
+        started_monotonic,
+        remaining
+      )
+    end
+  rescue
+    error -> failed_worker_run(prepared, {:exception, error, __STACKTRACE__}, settings.git, root)
+  catch
+    kind, reason -> failed_worker_run(prepared, {kind, reason}, settings.git, root)
+  end
+
+  defp do_run_cell(
+         prepared,
+         prompt,
+         matrix_run_id,
+         root,
+         local_server,
+         settings,
+         started_monotonic,
+         remaining
+       ) do
+    started = DateTime.utc_now()
     timeout = min(settings.timeout_ms, remaining)
     {:ok, collector} = Agent.start_link(fn -> %{events: [], progress: []} end)
 
@@ -421,6 +521,8 @@ defmodule Hancho.MatrixRun do
       :ok
     end
 
+    security = Hancho.ProviderSecurity.options(prepared.provider, local_hosts(local_server))
+
     options =
       harness_options(
         prepared,
@@ -429,7 +531,8 @@ defmodule Hancho.MatrixRun do
         local_server,
         settings,
         timeout,
-        event_callback
+        event_callback,
+        security
       )
 
     {result, collected} =
@@ -466,6 +569,8 @@ defmodule Hancho.MatrixRun do
           do: "configured",
           else: "provider_default_unpinned"
         ),
+      "requested_model_matches_effective" =>
+        requested_model_matches_effective(prepared.requested_model, evidence),
       "harness_run_id" => harness_run_id(terminal, collected, result),
       "provider_session_id" => provider_session_id(terminal, events),
       "status" => terminal_status(result),
@@ -486,12 +591,9 @@ defmodule Hancho.MatrixRun do
         "retained" => true,
         "baseline" => prepared.baseline,
         "journal_directory" => Path.join([root, "journals", prepared.provider_name])
-      }
+      },
+      "safety" => safety_evidence(security.evidence, local_server)
     }
-  rescue
-    error -> failed_worker_run(prepared, {:exception, error, __STACKTRACE__}, settings.git, root)
-  catch
-    kind, reason -> failed_worker_run(prepared, {kind, reason}, settings.git, root)
   end
 
   defp harness_options(
@@ -501,23 +603,17 @@ defmodule Hancho.MatrixRun do
          local_server,
          settings,
          timeout,
-         event_callback
+         event_callback,
+         security
        ) do
-    security = Hancho.ProviderSecurity.options(prepared.provider, local_hosts(local_server))
-
-    provider_options =
-      security.provider_options
-      |> maybe_put(
-        :network_access_enabled,
-        prepared.provider == :codex and is_binary(local_server)
-      )
+    provider_options = security.provider_options
 
     [
       cwd: prepared.worktree,
       model: prepared.requested_model,
       env: prepared.mix_paths.env,
       approval_mode: approval_mode(prepared.provider),
-      sandbox_mode: sandbox_mode(prepared.provider),
+      sandbox_mode: sandbox_mode(prepared.provider, local_server),
       reasoning_effort: reasoning_effort(settings.reasoning_effort),
       runtime_timeout_ms: timeout,
       idle_timeout_ms: timeout,
@@ -557,13 +653,38 @@ defmodule Hancho.MatrixRun do
   end
 
   defp select_events(captured, {:ok, %{events: result_events}}) do
-    case Enum.reverse(captured) do
-      [] -> result_events
-      events -> events
-    end
+    captured
+    |> Enum.reverse()
+    |> Kernel.++(result_events)
+    |> unique_ordered_events()
   end
 
-  defp select_events(captured, _result), do: Enum.reverse(captured)
+  defp select_events(captured, _result) do
+    captured
+    |> Enum.reverse()
+    |> unique_ordered_events()
+  end
+
+  defp unique_ordered_events(events) do
+    events
+    |> Enum.with_index()
+    |> Enum.uniq_by(fn {event, index} -> event_identity(event, index) end)
+    |> Enum.sort_by(fn {event, index} -> {event_sequence(event), index} end)
+    |> Enum.map(&elem(&1, 0))
+  end
+
+  defp event_identity(%{sequence: sequence}, _index) when is_integer(sequence) and sequence > 0,
+    do: {:sequence, sequence}
+
+  defp event_identity(%{"sequence" => sequence}, _index)
+       when is_integer(sequence) and sequence > 0,
+       do: {:sequence, sequence}
+
+  defp event_identity(_event, index), do: {:position, index}
+
+  defp event_sequence(%{sequence: sequence}) when is_integer(sequence), do: sequence
+  defp event_sequence(%{"sequence" => sequence}) when is_integer(sequence), do: sequence
+  defp event_sequence(_event), do: 0
 
   defp workspace_evidence(worktree, cell_id, git, root) do
     status = git.status(working_dir: worktree, untracked_files: :all)
@@ -572,13 +693,9 @@ defmodule Hancho.MatrixRun do
     changes =
       case status do
         {:ok, value} ->
-          Enum.map(value.entries, fn entry ->
-            %{
-              "path" => entry.path,
-              "index" => entry.index,
-              "working_tree" => entry.working_tree
-            }
-          end)
+          value.entries
+          |> Enum.map(&workspace_change(&1, worktree))
+          |> Enum.sort_by(& &1["path"])
 
         {:error, _reason} ->
           []
@@ -591,8 +708,9 @@ defmodule Hancho.MatrixRun do
 
         {:ok, %Git.Diff{raw: raw}} ->
           path = Path.join([root, "patches", "#{cell_id}.patch"])
+          redacted = Evidence.redact(raw)
 
-          case File.write(path, raw, [:binary, :sync]) do
+          case File.write(path, redacted, [:binary, :sync]) do
             :ok ->
               case File.chmod(path, 0o600) do
                 :ok ->
@@ -600,7 +718,9 @@ defmodule Hancho.MatrixRun do
                     "status" => "available",
                     "path" => path,
                     "scope" => "tracked_changes_only",
-                    "bytes" => byte_size(raw),
+                    "bytes" => byte_size(redacted),
+                    "source_bytes" => byte_size(raw),
+                    "redacted" => redacted != raw,
                     "sha256" => Evidence.digest(raw)
                   }
 
@@ -636,6 +756,79 @@ defmodule Hancho.MatrixRun do
       "patch" => patch,
       "status_error" => case_error(status)
     }
+  end
+
+  defp workspace_change(entry, worktree) do
+    change = %{
+      "path" => entry.path,
+      "index" => entry.index,
+      "working_tree" => entry.working_tree
+    }
+
+    if untracked?(entry) do
+      Map.put(change, "content", untracked_content(worktree, entry.path))
+    else
+      change
+    end
+  end
+
+  defp untracked?(entry), do: entry.index == "?" and entry.working_tree == "?"
+
+  defp untracked_content(worktree, relative_path) do
+    root = Path.expand(worktree)
+    path = Path.expand(relative_path, root)
+
+    if path == root or not String.starts_with?(path, root <> "/") do
+      %{"status" => "error", "reason" => "path_outside_worktree"}
+    else
+      case File.lstat(path) do
+        {:ok, %File.Stat{type: :regular, size: size}} ->
+          case file_digest(path) do
+            {:ok, digest} ->
+              %{"status" => "available", "type" => "regular", "bytes" => size, "sha256" => digest}
+
+            {:error, reason} ->
+              %{"status" => "error", "type" => "regular", "reason" => normalize(reason)}
+          end
+
+        {:ok, %File.Stat{type: :symlink}} ->
+          case File.read_link(path) do
+            {:ok, target} ->
+              %{
+                "status" => "available",
+                "type" => "symlink",
+                "sha256" => Evidence.digest(target)
+              }
+
+            {:error, reason} ->
+              %{"status" => "error", "type" => "symlink", "reason" => normalize(reason)}
+          end
+
+        {:ok, %File.Stat{type: type}} ->
+          %{"status" => "not_hashed", "type" => to_string(type)}
+
+        {:error, reason} ->
+          %{"status" => "error", "reason" => normalize(reason)}
+      end
+    end
+  end
+
+  defp file_digest(path) do
+    with {:ok, device} <- File.open(path, [:read, :binary]) do
+      try do
+        digest_device(device, :crypto.hash_init(:sha256))
+      after
+        File.close(device)
+      end
+    end
+  end
+
+  defp digest_device(device, context) do
+    case IO.binread(device, 64 * 1024) do
+      :eof -> {:ok, context |> :crypto.hash_final() |> Base.encode16(case: :lower)}
+      {:error, reason} -> {:error, reason}
+      bytes -> digest_device(device, :crypto.hash_update(context, bytes))
+    end
   end
 
   defp stop_reason(runs, settings, started_at) do
@@ -726,6 +919,18 @@ defmodule Hancho.MatrixRun do
     base_run(cell, "skipped", %{"code" => "matrix_limit_reached", "limit" => reason})
   end
 
+  defp skipped_prepared_run(prepared, reason, root) do
+    prepared
+    |> skipped_run(reason)
+    |> put_in(["isolation"], %{
+      "mode" => "detached_git_worktree",
+      "worktree" => prepared.worktree,
+      "retained" => true,
+      "baseline" => prepared.baseline,
+      "journal_directory" => Path.join([root, "journals", prepared.provider_name])
+    })
+  end
+
   defp failed_setup_run(cell, worktree, reason) do
     cell
     |> base_run("failed", %{"code" => "isolation_setup_failed", "reason" => normalize(reason)})
@@ -744,13 +949,26 @@ defmodule Hancho.MatrixRun do
     prepared
     |> base_run("failed", %{"code" => "matrix_worker_failed", "reason" => normalize(reason)})
     |> put_in(["evidence", "file_changes"], %{
-      "status" => if(workspace["changes"] == [], do: "not_observed", else: "observed"),
+      "status" =>
+        cond do
+          workspace["status_error"] != nil or get_in(workspace, ["patch", "status"]) == "error" ->
+            "error"
+
+          workspace["changes"] == [] ->
+            "not_observed"
+
+          true ->
+            "observed"
+        end,
       "workspace" => workspace["changes"],
       "harness_events" => [],
       "patch" => workspace["patch"],
+      "status_error" => workspace["status_error"],
       "digest" =>
         Evidence.digest(%{
           "changes" => workspace["changes"],
+          "status_error" => workspace["status_error"],
+          "patch_status" => get_in(workspace, ["patch", "status"]),
           "patch_sha256" => get_in(workspace, ["patch", "sha256"])
         })
     })
@@ -771,6 +989,7 @@ defmodule Hancho.MatrixRun do
       "requested_model" => cell.requested_model,
       "requested_model_source" =>
         if(is_binary(cell.requested_model), do: "configured", else: "provider_default_unpinned"),
+      "requested_model_matches_effective" => nil,
       "harness_run_id" => nil,
       "provider_session_id" => nil,
       "status" => status,
@@ -797,6 +1016,14 @@ defmodule Hancho.MatrixRun do
         "retained" => false,
         "baseline" => nil,
         "journal_directory" => nil
+      },
+      "safety" => %{
+        "credential_protection" => nil,
+        "commerce" => %{
+          "mode" => "not_started",
+          "network_allowlist_enforced" => false,
+          "real_transactions" => "prohibited_by_task_policy"
+        }
       }
     }
   end
@@ -817,6 +1044,7 @@ defmodule Hancho.MatrixRun do
         "workspace" => [],
         "harness_events" => [],
         "patch" => nil,
+        "status_error" => nil,
         "digest" => Evidence.digest([])
       },
       "tests" => %{"status" => "not_observed", "evidence" => []},
@@ -835,6 +1063,12 @@ defmodule Hancho.MatrixRun do
   defp terminal_result({:ok, result}), do: result
   defp terminal_result(_result), do: nil
   defp terminal_status({:ok, %{status: status}}), do: Atom.to_string(status)
+
+  defp terminal_status(
+         {:error, {:harness_await_timeout, _run_id, _cancel, {:ok, %{status: :cancelled}}}}
+       ),
+       do: "cancelled"
+
   defp terminal_status({:error, _reason}), do: "failed"
   defp terminal_status(_result), do: "failed"
 
@@ -904,14 +1138,50 @@ defmodule Hancho.MatrixRun do
   defp approval_mode(provider) when provider in [:grok, :opencode, :pi], do: :auto_approve
   defp approval_mode(provider) when provider in [:amp, :kimi], do: :default
   defp approval_mode(_provider), do: :auto_edit
-  defp sandbox_mode(provider) when provider in [:amp, :kimi, :opencode, :pi], do: :default
-  defp sandbox_mode(_provider), do: :workspace_write
+
+  defp sandbox_mode(provider, local_server)
+       when provider in @local_server_providers and is_binary(local_server),
+       do: :default
+
+  defp sandbox_mode(provider, _local_server) when provider in [:amp, :kimi, :opencode, :pi],
+    do: :default
+
+  defp sandbox_mode(_provider, _local_server), do: :workspace_write
 
   defp reasoning_effort(nil), do: nil
   defp reasoning_effort(value), do: String.to_existing_atom(value)
 
-  defp maybe_put(map, _key, false), do: map
-  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+  defp requested_model_matches_effective(nil, _evidence), do: nil
+
+  defp requested_model_matches_effective(requested, evidence) do
+    case get_in(evidence, ["effective_model", "value"]) do
+      effective when is_binary(effective) -> requested == effective
+      _value -> nil
+    end
+  end
+
+  defp safety_evidence(credential_protection, nil) do
+    %{
+      "credential_protection" => normalize(credential_protection),
+      "commerce" => %{
+        "mode" => "no_local_server",
+        "network_allowlist_enforced" => false,
+        "real_transactions" => "prohibited_by_task_policy"
+      }
+    }
+  end
+
+  defp safety_evidence(credential_protection, local_server) do
+    %{
+      "credential_protection" => normalize(credential_protection),
+      "commerce" => %{
+        "mode" => "loopback_fixture",
+        "origin" => local_server,
+        "network_allowlist_enforced" => true,
+        "real_transactions" => "prohibited_by_task_policy"
+      }
+    }
+  end
 
   defp limit_reached?(_observed, nil), do: false
   defp limit_reached?(observed, limit), do: observed >= limit

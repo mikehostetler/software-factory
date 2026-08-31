@@ -48,6 +48,10 @@ defmodule Hancho.MatrixRun.Comparison do
       "One or more cells have no observed test result."
     )
     |> add_reason(
+      Enum.any?(runs, &(get_in(&1, ["evidence", "file_changes", "status"]) == "error")),
+      "One or more cells have incomplete Git file evidence."
+    )
+    |> add_reason(
       Enum.any?(runs, &get_in(&1, ["output", "truncated"])),
       "One or more output values were truncated."
     )
@@ -70,6 +74,12 @@ defmodule Hancho.MatrixRun.Comparison do
   defp differences(runs) do
     [
       difference("status", runs, & &1["status"]),
+      difference("requested_model", runs, & &1["requested_model"]),
+      difference(
+        "requested_model_matches_effective",
+        runs,
+        & &1["requested_model_matches_effective"]
+      ),
       grouped_difference("output", runs, &get_in(&1, ["output", "sha256"])),
       grouped_difference(
         "file_changes",

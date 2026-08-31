@@ -14,6 +14,11 @@ defmodule Hancho.MatrixRunTest do
       File.write!(Path.join(options[:cwd], "README.md"), "changed by #{model}\n")
       File.write!(Path.join(options[:cwd], "#{model}.txt"), prompt)
 
+      File.write!(
+        Path.join(options[:cwd], "harness-options.txt"),
+        "#{inspect(options[:sandbox_mode])}\n#{options[:provider_options][:settings]}"
+      )
+
       events = [
         event(run_id, provider, 1, :run_started, %{"model" => effective_model}),
         event(run_id, provider, 2, :tool_call, %{
@@ -103,6 +108,83 @@ defmodule Hancho.MatrixRunTest do
     end
   end
 
+  defmodule NeverHarness do
+    def run_with_progress(_provider, _prompt, _options, _progress),
+      do: raise("the expired cell must not start")
+  end
+
+  defmodule SlowWorktreeSetup do
+    def prepare(worktree) do
+      Process.sleep(20)
+      Hancho.WorktreeSetup.prepare(worktree)
+    end
+  end
+
+  defmodule CancelledHarness do
+    def run_with_progress(provider, _prompt, options, progress) do
+      run_id = "harness-cancelled"
+
+      event =
+        Event.new!(provider: provider, type: :run_cancelled, payload: %{"reason" => "timeout"})
+        |> Event.attach(run_id, provider, 1)
+
+      progress.(%{harness_run_id: run_id, phase: :started})
+      options[:event_callback].([event])
+      {:error, {:harness_await_timeout, run_id, :ok, {:ok, %{status: :cancelled}}}}
+    end
+  end
+
+  defmodule SecretHarness do
+    def run_with_progress(provider, _prompt, options, _progress) do
+      secret = System.fetch_env!("HANCHO_MATRIX_TEST_API_KEY")
+      File.write!(Path.join(options[:cwd], "README.md"), "api key: #{secret}\n")
+
+      event =
+        Event.new!(
+          provider: provider,
+          type: :output_text_final,
+          payload: %{"text" => "Bearer #{secret}", "api_key" => secret}
+        )
+        |> Event.attach("harness-secret", provider, 1)
+
+      options[:event_callback].([event])
+
+      {:ok,
+       Jido.Harness.RunResult.new!(%{
+         run_id: "harness-secret",
+         provider: provider,
+         status: :completed,
+         text: "Bearer #{secret}",
+         events: [event]
+       })}
+    end
+  end
+
+  defmodule UntrackedHarness do
+    def run_with_progress(provider, _prompt, options, _progress) do
+      File.write!(Path.join(options[:cwd], "untracked.txt"), options[:model])
+
+      {:ok,
+       Jido.Harness.RunResult.new!(%{
+         run_id: "harness-untracked-#{options[:model]}",
+         provider: provider,
+         status: :completed,
+         text: "done",
+         events: []
+       })}
+    end
+  end
+
+  defmodule DiffFailureGit do
+    def status(options), do: Hancho.Git.status(options)
+    def head(options), do: Hancho.Git.head(options)
+
+    def create_worktree(repository, path, ref),
+      do: Hancho.Git.create_worktree(repository, path, ref)
+
+    def diff(_options), do: {:error, :forced_diff_failure}
+  end
+
   test "runs cells in isolated worktrees and saves comparable evidence" do
     project = temporary_project()
 
@@ -110,7 +192,7 @@ defmodule Hancho.MatrixRunTest do
              Hancho.MatrixRun.run(
                project,
                "Test the cart without a purchase.",
-               ["codex=alpha", "claude=beta"],
+               ["claude=alpha", "zai=beta"],
                harness: DeterministicHarness,
                concurrency: 2,
                local_server: "http://127.0.0.1:4567",
@@ -126,11 +208,11 @@ defmodule Hancho.MatrixRunTest do
     assert Enum.any?(report["comparison"]["differences"], &(&1["field"] == "output"))
 
     [alpha, beta] = report["runs"]
-    assert alpha["provider"] == "codex"
+    assert alpha["provider"] == "claude"
     assert alpha["requested_model"] == "alpha"
     assert alpha["evidence"]["effective_model"]["value"] == "effective-alpha"
     assert beta["evidence"]["effective_model"]["status"] == "unavailable"
-    assert alpha["harness_run_id"] == "harness-codex-alpha"
+    assert alpha["harness_run_id"] == "harness-claude-alpha"
     assert alpha["output"]["text"] == "output alpha"
     assert alpha["evidence"]["tool_activity"]["status"] == "observed"
     assert alpha["evidence"]["tests"]["status"] == "passed"
@@ -139,6 +221,8 @@ defmodule Hancho.MatrixRunTest do
     assert alpha["evidence"]["file_changes"]["patch"]["status"] == "available"
     assert alpha["usage"]["values"]["total_tokens"] == 100
     assert alpha["cost"]["value_usd"] == 0.1
+    assert alpha["requested_model_matches_effective"] == false
+    assert alpha["evidence"]["event_count"] == 9
 
     alpha_worktree = alpha["isolation"]["worktree"]
     beta_worktree = beta["isolation"]["worktree"]
@@ -146,6 +230,11 @@ defmodule Hancho.MatrixRunTest do
     assert File.read!(Path.join(alpha_worktree, "README.md")) == "changed by alpha\n"
     assert File.read!(Path.join(beta_worktree, "README.md")) == "changed by beta\n"
     assert File.read!(Path.join(project.root, "README.md")) == "baseline\n"
+
+    options_evidence = File.read!(Path.join(alpha_worktree, "harness-options.txt"))
+    assert options_evidence =~ ":default"
+    assert options_evidence =~ ~s("allowedDomains":["127.0.0.1"])
+    assert options_evidence =~ ~s("enabled":true)
 
     assert File.exists?(get_in(report, ["artifacts", "json"]))
     assert File.exists?(get_in(report, ["artifacts", "comparison"]))
@@ -232,6 +321,195 @@ defmodule Hancho.MatrixRunTest do
              )
 
     assert message =~ "host must be localhost"
+
+    assert {:error, {:validation, message}} =
+             Hancho.MatrixRun.run(project, "Task", ["codex=a"],
+               local_server: "http://127.0.0.1:4567"
+             )
+
+    assert message =~ "enforced loopback host allowlist"
+
+    assert {:error, {:validation, message}} =
+             Hancho.MatrixRun.run(project, "Task", ["amp=model-a"])
+
+    assert message =~ "does not support an explicit model"
+
+    assert {:error, {:validation, message}} =
+             Hancho.MatrixRun.run(project, "Task", ["gemini=model-a"], reasoning_effort: "high")
+
+    assert message =~ "does not support a reasoning effort"
+  end
+
+  test "does not start a cell after worktree setup consumes the matrix time limit" do
+    project = temporary_project()
+
+    assert {:ok, report} =
+             Hancho.MatrixRun.run(project, "Do not start.", ["codex=late", "claude=later"],
+               harness: NeverHarness,
+               worktree_setup: SlowWorktreeSetup,
+               max_time_ms: 1,
+               matrix_run_id: "matrix-expired-during-setup"
+             )
+
+    assert report["status"] == "limit_reached"
+    assert report["limits"]["stop_reason"] == "max_time_ms"
+    assert Enum.map(report["runs"], & &1["status"]) == ["skipped", "skipped"]
+    assert List.last(report["runs"])["isolation"]["mode"] == "not_started"
+  end
+
+  test "records a timeout cancellation as cancelled with terminal event evidence" do
+    project = temporary_project()
+
+    assert {:ok, report} =
+             Hancho.MatrixRun.run(project, "Wait for cancellation.", ["codex=cancel"],
+               harness: CancelledHarness,
+               matrix_run_id: "matrix-cancelled"
+             )
+
+    assert [run] = report["runs"]
+    assert run["status"] == "cancelled"
+    assert run["harness_run_id"] == "harness-cancelled"
+    assert run["evidence"]["event_count"] == 1
+  end
+
+  test "rejects a duplicate matrix run ID without replacing its report" do
+    project = temporary_project()
+    options = [harness: UntrackedHarness, matrix_run_id: "matrix-duplicate"]
+
+    assert {:ok, report} =
+             Hancho.MatrixRun.run(project, "First task.", ["codex=first"], options)
+
+    json_path = get_in(report, ["artifacts", "json"])
+    original = File.read!(json_path)
+
+    assert {:error, {:validation, message}} =
+             Hancho.MatrixRun.run(project, "Second task.", ["codex=second"], options)
+
+    assert message =~ "already exists"
+    assert File.read!(json_path) == original
+  end
+
+  test "hashes untracked content when file paths are the same" do
+    project = temporary_project()
+
+    assert {:ok, report} =
+             Hancho.MatrixRun.run(
+               project,
+               "Write one untracked result.",
+               ["codex=first", "codex=second"],
+               harness: UntrackedHarness,
+               concurrency: 2,
+               matrix_run_id: "matrix-untracked-content"
+             )
+
+    [first, second] = report["runs"]
+
+    refute first["evidence"]["file_changes"]["digest"] ==
+             second["evidence"]["file_changes"]["digest"]
+
+    assert get_in(first, [
+             "evidence",
+             "file_changes",
+             "workspace",
+             Access.at(0),
+             "content",
+             "status"
+           ]) ==
+             "available"
+  end
+
+  test "redacts secrets from JSON, Markdown source data, output, events, and patches" do
+    project = temporary_project()
+    secret = "matrix-secret-#{System.unique_integer([:positive])}"
+    previous = System.get_env("HANCHO_MATRIX_TEST_API_KEY")
+    System.put_env("HANCHO_MATRIX_TEST_API_KEY", secret)
+
+    on_exit(fn ->
+      if previous,
+        do: System.put_env("HANCHO_MATRIX_TEST_API_KEY", previous),
+        else: System.delete_env("HANCHO_MATRIX_TEST_API_KEY")
+    end)
+
+    assert {:ok, report} =
+             Hancho.MatrixRun.run(
+               project,
+               "Use #{secret} only as test data.",
+               ["codex=secret"],
+               harness: SecretHarness,
+               matrix_run_id: "matrix-secret-filter"
+             )
+
+    json = File.read!(get_in(report, ["artifacts", "json"]))
+    markdown = File.read!(get_in(report, ["artifacts", "comparison"]))
+    patch = File.read!(get_in(hd(report["runs"]), ["evidence", "file_changes", "patch", "path"]))
+
+    refute json =~ secret
+    refute markdown =~ secret
+    refute patch =~ secret
+    assert json =~ "[REDACTED]"
+    assert patch =~ "[REDACTED]"
+    assert report["task"]["prompt"] =~ "[REDACTED]"
+    assert hd(report["runs"])["output"]["text"] =~ "[REDACTED]"
+  end
+
+  test "keeps Markdown tables stable for model delimiters" do
+    project = temporary_project()
+
+    assert {:ok, report} =
+             Hancho.MatrixRun.run(project, "Write a result.", ["codex=alpha|beta"],
+               harness: UntrackedHarness,
+               matrix_run_id: "matrix-markdown-escape"
+             )
+
+    markdown = File.read!(get_in(report, ["artifacts", "comparison"]))
+    assert markdown =~ "alpha\\|beta"
+    assert Hancho.MatrixRun.Report.markdown(report) == Hancho.MatrixRun.Report.markdown(report)
+  end
+
+  test "does not call a compile-only result a test result" do
+    events = [
+      %{
+        type: :tool_result,
+        sequence: 1,
+        payload: %{"call_id" => "compile", "output" => "Compiled 10 files", "is_error" => false}
+      }
+    ]
+
+    workspace = %{
+      "changes" => [],
+      "patch" => %{"status" => "not_observed", "sha256" => nil},
+      "status_error" => nil
+    }
+
+    evidence = Hancho.MatrixRun.Evidence.from(events, workspace, nil)
+    assert evidence["tests"]["status"] == "not_observed"
+  end
+
+  test "does not account a negative provider cost" do
+    usage = %{"scope" => "run", "values" => %{}}
+    events = [%{type: :usage, payload: %{"cost_usd" => -1.0}}]
+
+    assert %{"status" => "unavailable", "additive" => false, "value_usd" => nil} =
+             Hancho.MatrixRun.Evidence.observed_cost(:codex, usage, events)
+  end
+
+  test "marks a Git evidence failure as incomplete" do
+    project = temporary_project()
+
+    assert {:ok, report} =
+             Hancho.MatrixRun.run(project, "Write a result.", ["codex=git-error"],
+               harness: UntrackedHarness,
+               git: DiffFailureGit,
+               matrix_run_id: "matrix-git-evidence-error"
+             )
+
+    assert [run] = report["runs"]
+    assert run["evidence"]["file_changes"]["status"] == "error"
+    assert report["comparison"]["status"] == "incomplete"
+
+    assert "One or more cells have incomplete Git file evidence." in report["comparison"][
+             "incomplete_reasons"
+           ]
   end
 
   defp temporary_project do

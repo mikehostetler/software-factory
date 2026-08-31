@@ -37,7 +37,7 @@ defmodule Hancho.MatrixRun.Cell do
         {:error, "A matrix cell has no provider."}
 
       model == :invalid ->
-        {:error, "Matrix cell #{provider}= has no model."}
+        {:error, "Matrix cell #{provider} has an invalid model value."}
 
       true ->
         case Hancho.Actions.Implement.provider(provider) do
@@ -60,9 +60,21 @@ defmodule Hancho.MatrixRun.Cell do
   defp normalize_model(nil), do: nil
 
   defp normalize_model(model) when is_binary(model) do
-    case String.trim(model) do
-      "" -> :invalid
-      value -> value
+    cond do
+      not String.valid?(model) ->
+        :invalid
+
+      byte_size(model) > 256 ->
+        :invalid
+
+      Regex.match?(~r/[[:cntrl:]]/u, model) ->
+        :invalid
+
+      true ->
+        case String.trim(model) do
+          "" -> :invalid
+          value -> value
+        end
     end
   end
 

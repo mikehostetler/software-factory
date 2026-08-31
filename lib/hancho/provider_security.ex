@@ -78,6 +78,9 @@ defmodule Hancho.ProviderSecurity do
   defp put_network_hosts(settings, []), do: settings
 
   defp put_network_hosts(settings, hosts) do
-    Map.put(settings, "sandbox", %{"network" => %{"allowedDomains" => hosts}})
+    Map.put(settings, "sandbox", %{
+      "enabled" => true,
+      "network" => %{"allowedDomains" => hosts}
+    })
   end
 end

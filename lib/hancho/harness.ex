@@ -6,6 +6,7 @@ defmodule Hancho.Harness do
   @default_productive_warning_ms 120_000
   @default_event_poll_interval_ms 500
   @default_cancellation_timeout_ms 30_000
+  @event_replay_limit 10_000
 
   def ensure_started do
     with :ok <- Hancho.Command.Runtime.ensure_started(),
@@ -83,9 +84,20 @@ defmodule Hancho.Harness do
         end
 
       case result do
-        {:ok, _result} -> result
-        {:error, :timeout} -> cancel_after_timeout(run_id, cancellation_timeout)
-        {:error, _reason} = error -> cancel_after_error(run_id, cancellation_timeout, error)
+        {:ok, _result} ->
+          result
+
+        {:error, {:timeout, cursor, latest}} ->
+          cancel_after_timeout(
+            run_id,
+            cancellation_timeout,
+            event_callback,
+            cursor,
+            latest
+          )
+
+        {:error, _reason} = error ->
+          cancel_after_error(run_id, cancellation_timeout, error)
       end
     end
   end
@@ -310,7 +322,7 @@ defmodule Hancho.Harness do
                    productive_event_count,
                    last_productive
                  ) do
-            {:error, :timeout}
+            {:error, {:timeout, next_cursor, latest}}
           end
         else
           previous_latest = latest
@@ -414,9 +426,11 @@ defmodule Hancho.Harness do
     end
   end
 
-  defp cancel_after_timeout(run_id, timeout) do
+  defp cancel_after_timeout(run_id, timeout, event_callback, cursor, latest) do
     cancel_result = Jido.Harness.Run.cancel(run_id)
     terminal = Jido.Harness.Run.await(run_id, timeout)
+    {_next_cursor, _latest, events} = replay(run_id, cursor, latest)
+    _result = notify_events(event_callback, events)
     {:error, {:harness_await_timeout, run_id, cancel_result, terminal}}
   end
 
@@ -457,10 +471,27 @@ defmodule Hancho.Harness do
   end
 
   defp replay(run_id, cursor, latest) do
-    case Jido.Harness.Run.replay(run_id, cursor: cursor, limit: 10_000) do
-      {:ok, []} -> {cursor, latest, []}
-      {:ok, events} -> {List.last(events).sequence, List.last(events), events}
-      {:error, _reason} -> {cursor, latest, []}
+    replay_next(run_id, cursor, latest, [])
+  end
+
+  defp replay_next(run_id, cursor, latest, batches) do
+    case Jido.Harness.Run.replay(run_id, cursor: cursor, limit: @event_replay_limit) do
+      {:ok, []} ->
+        {cursor, latest, batches |> Enum.reverse() |> List.flatten()}
+
+      {:ok, events} ->
+        next_cursor = List.last(events).sequence
+        next_latest = List.last(events)
+        batches = [events | batches]
+
+        if length(events) == @event_replay_limit and next_cursor > cursor do
+          replay_next(run_id, next_cursor, next_latest, batches)
+        else
+          {next_cursor, next_latest, batches |> Enum.reverse() |> List.flatten()}
+        end
+
+      {:error, _reason} ->
+        {cursor, latest, batches |> Enum.reverse() |> List.flatten()}
     end
   end
 

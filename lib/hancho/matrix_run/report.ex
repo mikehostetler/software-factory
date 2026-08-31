@@ -5,7 +5,11 @@ defmodule Hancho.MatrixRun.Report do
   def persist(report, root) do
     json_path = Path.join(root, "report.json")
     markdown_path = Path.join(root, "comparison.md")
-    report = put_in(report, ["artifacts"], %{"json" => json_path, "comparison" => markdown_path})
+
+    report =
+      report
+      |> put_in(["artifacts"], %{"json" => json_path, "comparison" => markdown_path})
+      |> Hancho.MatrixRun.Evidence.redact()
 
     with :ok <- File.mkdir_p(root),
          :ok <- File.chmod(root, 0o700),
@@ -60,19 +64,37 @@ defmodule Hancho.MatrixRun.Report do
         tokens = get_in(run, ["usage", "values", "total_tokens"]) || "not reported"
         cost = get_in(run, ["cost", "value_usd"]) || "not reported"
 
-        "| #{run["cell_id"]} | #{run["provider"]} | #{model} | #{effective} | #{run["status"]} | #{get_in(run, ["timing", "elapsed_ms"])} | #{tests} | #{changes} | #{tokens} | #{cost} |"
+        values = [
+          run["cell_id"],
+          run["provider"],
+          model,
+          effective,
+          run["status"],
+          get_in(run, ["timing", "elapsed_ms"]),
+          tests,
+          changes,
+          tokens,
+          cost
+        ]
+
+        "| " <> Enum.map_join(values, " | ", &table_value/1) <> " |"
       end)
 
     differences =
       case comparison["differences"] do
-        [] -> "No differences were observed in the compared fields."
-        values -> Enum.map_join(values, "\n", &"- **#{&1["field"]}:** #{difference_value(&1)}")
+        [] ->
+          "No differences were observed in the compared fields."
+
+        values ->
+          Enum.map_join(values, "\n", fn difference ->
+            "- **#{inline_value(difference["field"])}:** #{inline_value(difference_value(difference))}"
+          end)
       end
 
     incomplete =
       case comparison["incomplete_reasons"] do
         [] -> "No missing comparison evidence was detected."
-        values -> Enum.map_join(values, "\n", &"- #{&1}")
+        values -> Enum.map_join(values, "\n", &"- #{inline_value(&1)}")
       end
 
     """
@@ -112,8 +134,26 @@ defmodule Hancho.MatrixRun.Report do
     "- #{run["cell_id"]}: #{run["status"]}; #{run["provider"]}; requested #{requested}; effective #{effective}; #{changed} changed paths; #{get_in(run, ["timing", "elapsed_ms"])} ms"
   end
 
-  defp difference_value(%{"values" => values}), do: inspect(values)
-  defp difference_value(%{"groups" => groups}), do: inspect(groups)
+  defp difference_value(%{"values" => values}), do: Jason.encode!(values)
+  defp difference_value(%{"groups" => groups}), do: Jason.encode!(groups)
+
+  defp table_value(value) do
+    value
+    |> to_string()
+    |> String.replace("\\", "\\\\")
+    |> String.replace("|", "\\|")
+    |> String.replace(~r/[\r\n]+/, " ")
+    |> String.replace("<", "&lt;")
+    |> String.replace(">", "&gt;")
+  end
+
+  defp inline_value(value) do
+    value
+    |> to_string()
+    |> String.replace(~r/[\r\n]+/, " ")
+    |> String.replace("<", "&lt;")
+    |> String.replace(">", "&gt;")
+  end
 
   defp atomic_write(path, contents) do
     temporary = path <> ".tmp-" <> nonce()

@@ -5,7 +5,7 @@ defmodule Hancho.MatrixRun.Evidence do
   @activity_event_limit 1_000
   @run_scoped_cost_providers [:amp, :claude, :codex, :gemini, :zai]
   @test_command ~r/(^|\s)(mix\s+(test|check)|cargo\s+test|go\s+test|pytest|npm\s+(test|run\s+test)|pnpm\s+test|yarn\s+test|bundle\s+exec\s+rspec)(\s|$)/i
-  @test_output ~r/(\d+\s+tests?|\d+\s+passed|0 failures|test result|mix check|compil(?:e|ed))/i
+  @test_output ~r/(\d+\s+tests?|\d+\s+passed|0 failures|test result|mix check)/i
 
   @spec from([term()], map(), String.t() | nil) :: map()
   def from(events, workspace, local_server) do
@@ -30,10 +30,13 @@ defmodule Hancho.MatrixRun.Evidence do
         _other -> {event_text(events), false}
       end
 
+    original_size = byte_size(text)
+    redacted = redact(text)
+
     %{
-      "text" => tail(text, @event_output_limit),
-      "truncated" => truncated or byte_size(text) > @event_output_limit,
-      "sha256" => digest(text)
+      "text" => tail(redacted, @event_output_limit),
+      "truncated" => truncated or original_size > @event_output_limit,
+      "sha256" => digest(redacted)
     }
   end
 
@@ -62,7 +65,7 @@ defmodule Hancho.MatrixRun.Evidence do
           end
         end)
 
-    if is_number(value) do
+    if is_number(value) and value >= 0 do
       scope = cost_scope(provider, usage)
 
       %{
@@ -87,12 +90,15 @@ defmodule Hancho.MatrixRun.Evidence do
     |> Base.encode16(case: :lower)
   end
 
+  @spec redact(term()) :: term()
+  def redact(value), do: Jido.Harness.Redaction.redact(value)
+
   defp normalize_event(%Jido.Harness.Event{} = event) do
     %{
       "sequence" => event.sequence,
       "timestamp" => event.timestamp,
       "type" => Atom.to_string(event.type),
-      "payload" => bounded(event.payload)
+      "payload" => event.payload |> redact() |> bounded()
     }
   end
 
@@ -101,12 +107,17 @@ defmodule Hancho.MatrixRun.Evidence do
       "sequence" => Map.get(event, :sequence, Map.get(event, "sequence", 0)),
       "timestamp" => Map.get(event, :timestamp, Map.get(event, "timestamp")),
       "type" => event |> event_type() |> to_string(),
-      "payload" => event |> event_payload() |> bounded()
+      "payload" => event |> event_payload() |> redact() |> bounded()
     }
   end
 
   defp normalize_event(event) do
-    %{"sequence" => 0, "timestamp" => nil, "type" => "unknown", "payload" => bounded(event)}
+    %{
+      "sequence" => 0,
+      "timestamp" => nil,
+      "type" => "unknown",
+      "payload" => event |> redact() |> bounded()
+    }
   end
 
   defp bounded(value) when is_binary(value), do: tail(value, @event_output_limit)
@@ -128,8 +139,12 @@ defmodule Hancho.MatrixRun.Evidence do
         end
       end)
 
-    if is_binary(model) and model != "" do
-      %{"status" => "observed", "value" => model, "source" => "harness.run_started"}
+    if is_binary(model) and String.trim(model) != "" do
+      %{
+        "status" => "observed",
+        "value" => String.trim(model),
+        "source" => "harness.run_started_payload"
+      }
     else
       %{"status" => "unavailable", "value" => nil, "source" => nil}
     end
@@ -164,15 +179,31 @@ defmodule Hancho.MatrixRun.Evidence do
       |> Enum.take(-@activity_event_limit)
 
     changes = Map.get(workspace, "changes", [])
+    status_error = Map.get(workspace, "status_error")
+    patch = Map.get(workspace, "patch")
+
+    evidence_error? =
+      not is_nil(status_error) or get_in(patch || %{}, ["status"]) == "error" or
+        Enum.any?(changes, &(get_in(&1, ["content", "status"]) == "error"))
 
     %{
       "status" =>
-        if(changes == [] and harness_events == [], do: "not_observed", else: "observed"),
+        cond do
+          evidence_error? -> "error"
+          changes == [] and harness_events == [] -> "not_observed"
+          true -> "observed"
+        end,
       "workspace" => changes,
       "harness_events" => harness_events,
-      "patch" => Map.get(workspace, "patch"),
+      "patch" => patch,
+      "status_error" => status_error,
       "digest" =>
-        digest(%{"changes" => changes, "patch_sha256" => get_in(workspace, ["patch", "sha256"])})
+        digest(%{
+          "changes" => changes,
+          "status_error" => status_error,
+          "patch_status" => get_in(workspace, ["patch", "status"]),
+          "patch_sha256" => get_in(workspace, ["patch", "sha256"])
+        })
     }
   end
 
@@ -180,6 +211,7 @@ defmodule Hancho.MatrixRun.Evidence do
     calls =
       tools
       |> Enum.filter(&(&1["type"] == "tool_call"))
+      |> Enum.filter(&is_binary(get_in(&1, ["payload", "call_id"])))
       |> Map.new(fn event -> {get_in(event, ["payload", "call_id"]), event} end)
 
     evidence =
