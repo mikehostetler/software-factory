@@ -470,6 +470,86 @@ defmodule Hancho.WorkflowTest do
     assert :ok = Store.flush(store)
   end
 
+  test "starts the next step after a crash between sequential steps" do
+    {project, _workflow_path} = project_with_workflow(successful_workflow())
+    assert {:ok, definition, source} = Loader.load_with_source(project, "test")
+    assert {:ok, store} = Store.open(project.bedrock_path)
+
+    assert :ok =
+             Store.create_run(store, "run-between-steps", definition, %{"number" => 3}, source)
+
+    assert :ok = Store.start_step(store, "run-between-steps", 0, hd(definition.steps), %{})
+
+    assert :ok =
+             Store.complete_step(store, "run-between-steps", 0, %{"value" => 4}, %{
+               "first" => %{"value" => 4}
+             })
+
+    assert :ok = Store.flush(store)
+
+    assert {:ok, completed} =
+             Runner.retry(project, "run-between-steps",
+               registry: Registry,
+               executor: TransientExecutor,
+               services: %{test_pid: self()},
+               reconciler: RetryReconciler,
+               log: :disabled,
+               flush_state: false
+             )
+
+    assert completed.status == :completed
+    assert completed.outputs["second"] == %{"value" => 8}
+    refute_received :first_executed
+    assert_received :second_executed
+
+    assert {:ok, steps} = Store.list_steps(store, "run-between-steps")
+    assert Enum.map(steps, & &1["status"]) == ["completed", "completed"]
+    assert :ok = Store.flush(store)
+  end
+
+  test "retries an idempotent retry_pending transition after a crash" do
+    {project, _workflow_path} = project_with_workflow(successful_workflow())
+    assert {:ok, definition, source} = Loader.load_with_source(project, "test")
+    assert {:ok, store} = Store.open(project.bedrock_path)
+
+    assert :ok =
+             Store.create_run(store, "run-retry-pending", definition, %{"number" => 3}, source)
+
+    assert :ok = Store.start_step(store, "run-retry-pending", 0, hd(definition.steps), %{})
+
+    assert :ok =
+             Store.stop_run_and_step(
+               store,
+               "run-retry-pending",
+               0,
+               "first",
+               :interrupted
+             )
+
+    assert :ok = Store.retry_run(store, "run-retry-pending", 0)
+    assert :ok = Store.flush(store)
+
+    assert {:ok, completed} =
+             Runner.retry(project, "run-retry-pending",
+               registry: Registry,
+               executor: Executor,
+               reconciler: RetryReconciler,
+               log: :disabled,
+               flush_state: false
+             )
+
+    assert completed.status == :completed
+
+    assert completed.outputs == %{
+             "first" => %{"value" => 4},
+             "second" => %{"value" => 8}
+           }
+
+    assert {:ok, steps} = Store.list_steps(store, "run-retry-pending")
+    assert Enum.map(steps, & &1["status"]) == ["completed", "completed"]
+    assert :ok = Store.flush(store)
+  end
+
   test "repairs an approved gate failure and retries only that gate" do
     {project, _workflow_path} = project_with_workflow(repair_workflow())
 

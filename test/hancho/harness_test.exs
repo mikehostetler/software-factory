@@ -120,6 +120,16 @@ defmodule Hancho.HarnessTest do
                payload: %{"call_id" => "call-1", "name" => "write_file"}
              )
            ]}
+
+        "retention gap" ->
+          {:ok,
+           Enum.map(1..10, fn sequence ->
+             Event.new!(
+               provider: :codex,
+               type: :thinking_delta,
+               payload: %{"text" => String.duplicate(Integer.to_string(sequence), 400)}
+             )
+           end)}
       end
     end
   end
@@ -446,6 +456,30 @@ defmodule Hancho.HarnessTest do
              end)
 
     assert_received {:partial_progress, %{phase: :stream_andon, harness_run_id: ^run_id}}
+    assert :ok = Jido.Harness.Run.prune(run_id)
+  end
+
+  test "stops a completed run when journal retention removed stream evidence" do
+    install_adapter(FailureAdapter)
+    provider_config = Application.get_env(:jido_harness, :provider_config)
+    config = provider_config |> then(&Map.new(&1 || %{})) |> Map.get(:codex, %{}) |> Map.new()
+
+    Application.put_env(
+      :jido_harness,
+      :provider_config,
+      Map.put(
+        Map.new(provider_config || %{}),
+        :codex,
+        Map.put(config, :retention, %{segment_bytes: 200, disk_limit_bytes: 200})
+      )
+    )
+
+    on_exit(fn -> restore_env(:provider_config, provider_config) end)
+
+    assert {:error, %{code: "harness_stream_invalid", harness_run_id: run_id, issues: issues}} =
+             run_failure_case("retention gap", fn _progress -> :ok end)
+
+    assert Enum.any?(issues, &(&1.code == "event_replay_gap"))
     assert :ok = Jido.Harness.Run.prune(run_id)
   end
 

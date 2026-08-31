@@ -90,7 +90,7 @@ defmodule Hancho.Workflow.Runner do
          {:ok, input} <- Jason.decode(run["input_json"]),
          {:ok, _compiled} <- compiler.compile(project, definition, input, options),
          {:ok, steps} <- store_api.list_steps(store, run_id),
-         {:ok, recovery} <- recovery_action(steps),
+         {:ok, recovery} <- recovery_action(steps, definition),
          {:ok, outputs} <- completed_outputs(steps),
          {:ok, repairs} <- Repair.from_steps(steps) do
       case reconciler.retry(
@@ -177,11 +177,18 @@ defmodule Hancho.Workflow.Runner do
     store_api.mark_recovery_required(store, run_id, position, step, error)
   end
 
+  defp persist_recovery_andon(store_api, store, run_id, {:start, _position}, step, error) do
+    store_api.mark_run_recovery_required(store, run_id, step, error)
+  end
+
   defp persist_recovery_andon(store_api, store, run_id, :finalize, step, error) do
     store_api.mark_run_recovery_required(store, run_id, step, error)
   end
 
   defp recovery_step(_run, definition, {:retry, position}),
+    do: Enum.at(definition.steps, position).name
+
+  defp recovery_step(_run, definition, {:start, position}),
     do: Enum.at(definition.steps, position).name
 
   defp recovery_step(run, _definition, :finalize), do: run["current_step"]
@@ -205,6 +212,39 @@ defmodule Hancho.Workflow.Runner do
              Hancho.Audit.write(log, "Workflow retry started",
                event: "workflow.retry_started",
                metadata: %{step: Enum.at(definition.steps, position).name}
+             ),
+           {:ok, result} <-
+             run_runtime(definition, input, run_id, store, log, options, %{
+               index: position,
+               outputs: outputs,
+               artifacts: definition |> Artifacts.from_outputs(outputs) |> put_repairs(repairs),
+               repairs: repairs
+             }) do
+        {:ok, attach_failure_evidence(project, result, store, options)}
+      end
+    end)
+  end
+
+  defp recover_run(
+         project,
+         definition,
+         input,
+         run_id,
+         store,
+         outputs,
+         repairs,
+         {:start, position},
+         options
+       ) do
+    store_api = Keyword.get(options, :store_api, Store)
+    step = Enum.at(definition.steps, position)
+
+    with_audit_log(project, run_id, options, fn log ->
+      with :ok <- store_api.resume_run(store, run_id, step.name),
+           :ok <-
+             Hancho.Audit.write(log, "Workflow retry started",
+               event: "workflow.retry_started",
+               metadata: %{step: step.name, recovery: "start_missing_step"}
              ),
            {:ok, result} <-
              run_runtime(definition, input, run_id, store, log, options, %{
@@ -345,20 +385,42 @@ defmodule Hancho.Workflow.Runner do
     error -> {:error, Exception.message(error)}
   end
 
-  defp recovery_action(steps) do
-    case Enum.find(steps, &(&1["status"] in ["stopped", "running", "recovery_required"])) do
-      nil -> completed_recovery(steps)
-      step -> {:ok, {:retry, step["position"]}}
+  defp recovery_action(steps, definition) do
+    with :ok <- validate_recovery_steps(steps, definition) do
+      case Enum.find(steps, &(&1["status"] != "completed")) do
+        nil -> completed_recovery(steps, definition)
+        step -> {:ok, {:retry, step["position"]}}
+      end
     end
   end
 
-  defp completed_recovery([]), do: {:error, :resumable_step_not_found}
-
-  defp completed_recovery(steps) do
-    if Enum.all?(steps, &(&1["status"] == "completed")) do
+  defp completed_recovery(steps, definition) do
+    if length(steps) == length(definition.steps) do
       {:ok, :finalize}
     else
-      {:error, :resumable_step_not_found}
+      {:ok, {:start, length(steps)}}
+    end
+  end
+
+  defp validate_recovery_steps(steps, definition) do
+    invalid =
+      steps
+      |> Enum.with_index()
+      |> Enum.find(fn {saved, position} ->
+        case Enum.at(definition.steps, position) do
+          nil ->
+            true
+
+          expected ->
+            saved["position"] != position or saved["name"] != expected.name or
+              saved["action"] != expected.action or
+              (saved["status"] != "completed" and position != length(steps) - 1)
+        end
+      end)
+
+    case invalid do
+      nil -> :ok
+      {step, position} -> {:error, {:invalid_recovery_step, position, step}}
     end
   end
 

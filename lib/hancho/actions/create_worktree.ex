@@ -36,7 +36,8 @@ defmodule Hancho.Actions.CreateWorktree do
   end
 
   defp reconcile(git, repository, path, baseline, receipt) do
-    with {:ok, registrations} <- git.worktrees(working_dir: repository),
+    with :ok <- safe_worktree_path(repository, path),
+         {:ok, registrations} <- git.worktrees(working_dir: repository),
          registration = find_registration(registrations, path) do
       case {File.dir?(path), registration} do
         {false, nil} -> :not_applied
@@ -48,7 +49,9 @@ defmodule Hancho.Actions.CreateWorktree do
   end
 
   defp create(git, repository, path, baseline, receipt) do
-    with :ok <- File.mkdir_p(Path.dirname(path)),
+    with :ok <- safe_worktree_path(repository, path),
+         :ok <- File.mkdir_p(Path.dirname(path)),
+         :ok <- safe_worktree_path(repository, path),
          {:ok, :done} <- git.create_worktree(repository, path, baseline),
          {:ok, ^receipt} <- reconcile(git, repository, path, baseline, receipt) do
       {:ok, receipt}
@@ -92,6 +95,47 @@ defmodule Hancho.Actions.CreateWorktree do
     else
       _error -> false
     end
+  end
+
+  defp safe_worktree_path(repository, path) do
+    hancho = Path.join(repository, ".hancho")
+    root = Path.join(hancho, "worktrees")
+
+    Enum.reduce_while([hancho, root, path], :ok, fn component, :ok ->
+      case File.lstat(component) do
+        {:ok, %File.Stat{type: :directory}} ->
+          {:cont, :ok}
+
+        {:ok, %File.Stat{type: type}} ->
+          {:halt, path_type_mismatch(component, path, type)}
+
+        {:error, :enoent} ->
+          {:cont, :ok}
+
+        {:error, reason} ->
+          {:halt,
+           {:error,
+            %{
+              code: "filesystem_check_failed",
+              field: "worktree_path_type",
+              path: Path.expand(path),
+              component: Path.expand(component),
+              error: Hancho.Log.Event.normalize(reason)
+            }}}
+      end
+    end)
+  end
+
+  defp path_type_mismatch(component, path, type) do
+    {:error,
+     %{
+       code: "filesystem_out_of_sync",
+       field: "worktree_path_type",
+       expected: "directory or missing",
+       actual: Atom.to_string(type),
+       path: Path.expand(path),
+       component: Path.expand(component)
+     }}
   end
 
   defp equal(_field, value, value, _path), do: :ok

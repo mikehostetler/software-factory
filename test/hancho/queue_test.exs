@@ -415,6 +415,40 @@ defmodule Hancho.QueueTest do
     end
   end
 
+  defmodule CompletionFlushStore do
+    def open(path), do: MemoryStore.open(path)
+
+    def create_queue(store, id, workflow, source, items, state),
+      do: MemoryStore.create_queue(store, id, workflow, source, items, state)
+
+    def fetch_queue(store, id), do: MemoryStore.fetch_queue(store, id)
+
+    def start_queue_item(store, id, position),
+      do: MemoryStore.start_queue_item(store, id, position)
+
+    def complete_queue_item(store, id, position, head) do
+      with :ok <- MemoryStore.complete_queue_item(store, id, position, head) do
+        Process.put({__MODULE__, :fail_flush}, true)
+        :ok
+      end
+    end
+
+    def flush(store) do
+      if Process.delete({__MODULE__, :fail_flush}) do
+        {:error, :disk_full}
+      else
+        MemoryStore.flush(store)
+      end
+    end
+
+    def stop_queue_item(_store, _id, _position, _error) do
+      send(self(), :unexpected_queue_stop_after_completion)
+      {:error, :queue_item_not_stoppable}
+    end
+
+    def complete_queue(store, id), do: MemoryStore.complete_queue(store, id)
+  end
+
   defmodule SummaryStore do
     def fetch_queue(:summary, "queue-summary") do
       {:ok,
@@ -533,6 +567,31 @@ defmodule Hancho.QueueTest do
     assert Enum.count(events, &(&1["event"] == "queue.reconciled")) == 6
     assert Enum.any?(events, &(&1["event"] == "queue.completed"))
     assert Enum.all?(events, &(&1["metadata"]["queue_id"] == "queue-test"))
+  end
+
+  test "keeps completed queue state visible when its durability flush fails" do
+    project = Hancho.Project.new(temporary_directory())
+
+    assert {:error,
+            %{
+              code: "queue_state_flush_failed",
+              queue_id: "queue-flush-failure",
+              transition: "item_completed",
+              flush_error: "disk_full"
+            }} =
+             QueueRunner.run(project, "implement", "beadwork-ready", 1,
+               beadwork: Beadwork,
+               reconciler: Reconciler,
+               workflow_runner: WorkflowRunner,
+               store_api: CompletionFlushStore,
+               queue_id: "queue-flush-failure",
+               log: :disabled
+             )
+
+    refute_received :unexpected_queue_stop_after_completion
+    assert {:ok, queue} = MemoryStore.fetch_queue(:memory, "queue-flush-failure")
+    assert queue["current_position"] == 1
+    assert hd(queue["items"])["status"] == "completed"
   end
 
   test "previews task readiness from all issues when ready returns only containers" do

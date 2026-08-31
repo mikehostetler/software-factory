@@ -450,8 +450,7 @@ defmodule Hancho.Workflow.QueueRunner do
              options
            ),
          landed when is_binary(landed) <- get_in(result.artifacts, ["landing", "commit"]),
-         :ok <- store_api.complete_queue_item(store, queue_id, position, landed),
-         :ok <- store_api.flush(store),
+         :ok <- persist_completed_item(store_api, store, queue_id, position, landed),
          :ok <-
            QueueReporter.emit(
              project,
@@ -477,6 +476,18 @@ defmodule Hancho.Workflow.QueueRunner do
           options
         )
 
+      {:error, {:queue_state_flush_failed, reason}} ->
+        queue_flush_failure(
+          project,
+          workflow,
+          queue_id,
+          items,
+          position,
+          item,
+          reason,
+          options
+        )
+
       {:error, reason} ->
         stop_for_error(
           project,
@@ -490,6 +501,41 @@ defmodule Hancho.Workflow.QueueRunner do
           options
         )
     end
+  end
+
+  defp persist_completed_item(store_api, store, queue_id, position, landed) do
+    with :ok <- store_api.complete_queue_item(store, queue_id, position, landed) do
+      case store_api.flush(store) do
+        :ok -> :ok
+        {:error, reason} -> {:error, {:queue_state_flush_failed, reason}}
+      end
+    end
+  end
+
+  defp queue_flush_failure(
+         project,
+         workflow,
+         queue_id,
+         items,
+         position,
+         item,
+         reason,
+         options
+       ) do
+    error = %{
+      code: "queue_state_flush_failed",
+      queue_id: queue_id,
+      issue_id: item.issue_id,
+      child_run_id: item.run_id,
+      position: position,
+      transition: "item_completed",
+      flush_error: Hancho.Log.Event.normalize(reason)
+    }
+
+    error =
+      with_queue_forensics(project, workflow, queue_id, items, position, item, error, options)
+
+    {:error, error}
   end
 
   defp stop_item(

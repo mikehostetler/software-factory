@@ -692,8 +692,13 @@ defmodule Hancho.Harness do
     end
   end
 
-  defp replay_all(_run_id, _cursor, 0, _pages),
-    do: {:error, {:event_replay_limit_exceeded, @stream_replay_limit}}
+  defp replay_all(run_id, cursor, 0, pages) do
+    case Jido.Harness.Run.replay(run_id, cursor: cursor, limit: 1) do
+      {:ok, []} -> {:ok, pages |> Enum.reverse() |> List.flatten()}
+      {:ok, _events} -> {:error, {:event_replay_limit_exceeded, @stream_replay_limit}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   defp replay_all(run_id, cursor, remaining, pages) do
     limit = min(remaining, @stream_replay_page_size)
@@ -743,6 +748,16 @@ defmodule Hancho.Harness do
 
   defp validate_event(%{type: :provider_event, payload: %{"decode_error" => error}}, state) do
     add_stream_issue(state, %{code: "malformed_provider_event", error: error})
+  end
+
+  defp validate_event(
+         %{type: :provider_event, payload: %{"kind" => "replay_gap"} = payload},
+         state
+       ) do
+    add_stream_issue(state, %{
+      code: "event_replay_gap",
+      available_from: payload["available_from"]
+    })
   end
 
   defp validate_event(

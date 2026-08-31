@@ -815,6 +815,53 @@ defmodule Hancho.ActionsTest do
     refute_received :unexpected_worktree_remove
   end
 
+  test "does not adopt a symlink to a detached worktree outside Hancho storage" do
+    repository = temporary_repository()
+    {:ok, baseline} = Hancho.Git.head(working_dir: repository)
+
+    external =
+      Path.join(System.tmp_dir!(), "hancho-external-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(external) end)
+    assert {:ok, :done} = Hancho.Git.create_worktree(repository, external, baseline)
+
+    path = Path.join([repository, ".hancho", "worktrees", "symlink-create"])
+    assert :ok = File.mkdir_p(Path.dirname(path))
+    assert :ok = File.ln_s(external, path)
+
+    assert {:error, error} =
+             Jido.Exec.run(
+               Actions.CreateWorktree,
+               %{repo_path: repository, baseline: baseline, run_id: "symlink-create"},
+               effect_context(Hancho.Git),
+               max_retries: 0
+             )
+
+    assert Exception.message(error) =~ "filesystem_out_of_sync"
+    assert Exception.message(error) =~ "worktree_path_type"
+    assert_received :effect_intent_checked
+    assert_received {:effect_reconciliation_failed, %{actual: "symlink"}}
+    assert File.read_link!(path) == external
+  end
+
+  test "does not remove a nested path inside a retained worktree" do
+    repository =
+      Path.join(System.tmp_dir!(), "hancho-remove-safety-#{System.unique_integer([:positive])}")
+
+    path = Path.join([repository, ".hancho", "worktrees", "run", "nested"])
+
+    assert {:error, error} =
+             Jido.Exec.run(
+               Actions.RemoveWorktree,
+               %{repo_path: repository, worktree_path: path},
+               effect_context(Hancho.Git),
+               max_retries: 0
+             )
+
+    assert Exception.message(error) =~ "refused to remove"
+    refute_received :effect_intent_checked
+  end
+
   defp effect_context(git) do
     %{
       services: %{git: git},

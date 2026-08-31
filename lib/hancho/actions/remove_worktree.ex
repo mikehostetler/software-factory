@@ -21,20 +21,24 @@ defmodule Hancho.Actions.RemoveWorktree do
     relative = Path.relative_to(path, root)
 
     case Path.safe_relative(relative, root) do
-      {:ok, relative} when relative != "." ->
-        receipt = %{worktree_path: path, removed: true}
+      {:ok, relative} ->
+        if direct_child?(relative) do
+          receipt = %{worktree_path: path, removed: true}
 
-        Effect.run(
-          context,
-          "remove",
-          "git.worktree.remove",
-          %{repository: params.repo_path, path: path},
-          fn -> reconcile(git, params.repo_path, path, receipt) end,
-          fn -> remove(git, params.repo_path, path, receipt) end
-        )
+          Effect.run(
+            context,
+            "remove",
+            "git.worktree.remove",
+            %{repository: params.repo_path, path: path},
+            fn -> reconcile(git, params.repo_path, path, receipt) end,
+            fn -> remove(git, params.repo_path, path, receipt) end
+          )
+        else
+          unsafe_path()
+        end
 
       _other ->
-        {:error, "Hancho refused to remove a path outside its worktree folder."}
+        unsafe_path()
     end
   end
 
@@ -65,6 +69,13 @@ defmodule Hancho.Actions.RemoveWorktree do
       end
     end
   end
+
+  defp direct_child?(relative) do
+    relative != "." and Path.dirname(relative) == "." and Path.basename(relative) == relative
+  end
+
+  defp unsafe_path,
+    do: {:error, "Hancho refused to remove a path outside its worktree folder."}
 
   defp same_path?(left, right) do
     Path.expand(left) == Path.expand(right) or same_file?(left, right) or

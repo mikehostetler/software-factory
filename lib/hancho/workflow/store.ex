@@ -125,7 +125,11 @@ defmodule Hancho.Workflow.Store do
            :ok <- status_in(run, ["stopped", "running", "recovery_required"], :run_not_resumable),
            {:ok, step} <- get_step(step_key),
            :ok <-
-             status_in(step, ["stopped", "running", "recovery_required"], :step_not_resumable) do
+             status_in(
+               step,
+               ["stopped", "running", "recovery_required", "retry_pending"],
+               :step_not_resumable
+             ) do
         retried_run =
           run
           |> Map.put("status", "running")
@@ -142,6 +146,24 @@ defmodule Hancho.Workflow.Store do
         put_step(step_key, bump(retried_step))
       else
         {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+  end
+
+  @spec resume_run(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def resume_run(store, run_id, step_name) do
+    update_run(store, run_id, fn run ->
+      with :ok <-
+             status_in(
+               run,
+               ["stopped", "running", "recovery_required"],
+               :run_not_resumable
+             ) do
+        run
+        |> Map.put("status", "running")
+        |> Map.put("current_step", step_name)
+        |> Map.put("finished_at", nil)
+        |> Map.put("error_json", nil)
       end
     end)
   end

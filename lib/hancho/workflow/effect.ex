@@ -57,13 +57,18 @@ defmodule Hancho.Workflow.Effect do
     end
   end
 
-  defp decode_receipt(%{"receipt_json" => receipt}) do
+  defp decode_receipt(%{"receipt_json" => nil}),
+    do: {:error, {:invalid_effect_receipt, nil}}
+
+  defp decode_receipt(%{"receipt_json" => receipt}) when is_binary(receipt) do
     case Jason.decode(receipt) do
       {:ok, decoded} when is_map(decoded) -> {:ok, decoded}
       {:ok, decoded} -> {:error, {:invalid_effect_receipt, decoded}}
       {:error, reason} -> {:error, {:invalid_effect_receipt, Exception.message(reason)}}
     end
   end
+
+  defp decode_receipt(record), do: {:error, {:invalid_effect_record, record}}
 
   defp durable(api, store, key) do
     if function_exported?(api, :flush, 1) do
