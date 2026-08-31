@@ -1,0 +1,3 @@
+opencode/free-test
+anthropic/claude-test
+not a model record

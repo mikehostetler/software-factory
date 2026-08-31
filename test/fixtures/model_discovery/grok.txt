@@ -1,0 +1,7 @@
+You are not authenticated.
+
+Default model: grok-default-only
+
+Available models:
+  * grok-test (default)
+  - grok-fast

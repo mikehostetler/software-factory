@@ -207,6 +207,41 @@ Jido.Harness does not report the effective model for all providers, so Hancho
 can always prove the requested model but cannot always prove provider fallback
 behavior.
 
+### Model discovery
+
+Run `hancho models` to inspect model evidence for every CLI provider referenced
+by a repository-local workflow role, implementation step, or repair policy.
+The command keeps these facts separate:
+
+- `CLI-reported models` come only from a supported non-interactive CLI catalog
+  command. Hancho currently reads catalogs from Amp, Codex, Grok, Kimi Code,
+  OpenCode, and Pi. Other providers report that catalog discovery is not
+  supported.
+- `User-configured models` are explicit `model` values in workflow YAML. A
+  provider default is not added to this list.
+- `Smoke-accepted models` are explicit configured models that completed a
+  read-only smoke request. Hancho does not run a smoke request when no model is
+  configured. It also does not run one when Harness cannot enforce a read-only
+  sandbox for that provider.
+- Each smoke result names the requested model and the effective model when a
+  normalized provider event reports it. If the effective model differs from
+  the request, Hancho reports `fallback_observed` and does not put the requested
+  model in the accepted list.
+- Supported reasoning levels come from the pinned Harness adapter. Authentication
+  is `authenticated`, `unauthenticated`, or `unknown`; `unknown` is retained
+  when a cached CLI login cannot be proved without a request.
+
+Smoke tests are disabled by default because they can use provider quota. Use
+`hancho models --smoke` to run them. They run in a new private empty temporary
+directory with a read-only sandbox and the safest approval setting supported by
+the adapter. A smoke result is not accepted if the provider reports a tool call
+or file change. Codex also disables workspace network access and skips only its
+Git-repository check. Pi disables tools, extensions, skills, context files, and
+session persistence. Use `hancho models --json` for schema-versioned
+machine-readable output. The report extracts model identifiers and normalized
+status only. It does not copy provider command output, environment values,
+credentials, or raw errors.
+
 Hancho requests the Harness `workspace_write` sandbox for adapters that support
 it. Amp, Kimi, OpenCode, and Pi use their adapter default because they cannot
 represent `workspace_write`. A step can set `sandbox_mode` to `default`,

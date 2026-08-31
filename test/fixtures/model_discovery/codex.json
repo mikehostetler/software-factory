@@ -1,0 +1,7 @@
+{
+  "models": [
+    {"slug": "gpt-test", "visibility": "list"},
+    {"slug": "gpt-hidden", "visibility": "hidden"}
+  ],
+  "access_token": "fixture-secret-must-not-appear"
+}

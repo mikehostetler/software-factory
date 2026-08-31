@@ -1,0 +1,7 @@
+{
+  "models": [
+    {"provider": "anthropic", "name": "claude-sonnet", "id": "anthropic/claude-sonnet"},
+    {"provider": "openai", "name": "gpt-codex", "id": "openai/gpt-codex"}
+  ],
+  "api_key": "fixture-secret-must-not-appear"
+}

@@ -1,0 +1,3 @@
+provider   model              context  max-out  thinking  images
+anthropic  claude-test        200K     64K      yes       yes
+openai     openai/gpt-test    128K     32K      yes       yes

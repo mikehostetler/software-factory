@@ -7,6 +7,8 @@ defmodule Hancho.CLI do
   Usage:
     hancho init       Initialize Hancho in the current repository
     hancho doctor     Inspect the repository and local tools
+    hancho models [--json] [--smoke]
+                      Discover model evidence for configured CLI providers
     hancho run WORKFLOW ISSUE_ID [--verbose]
                       Run one Beadwork workflow in the foreground
     hancho run inspect RUN_ID
@@ -50,7 +52,9 @@ defmodule Hancho.CLI do
     dry_run: :boolean,
     apply: :boolean,
     response: :string,
-    port: :integer
+    port: :integer,
+    json: :boolean,
+    smoke: :boolean
   ]
   @aliases [h: :help, v: :version]
 
@@ -99,6 +103,32 @@ defmodule Hancho.CLI do
       {:error, message} ->
         IO.puts(:stderr, "ERROR: #{message}")
         1
+    end
+  end
+
+  defp dispatch_command(arguments, parsed, options)
+       when arguments in [["models"], ["models", "discover"]] do
+    allowed = Keyword.drop(parsed, [:json, :smoke]) == []
+
+    if allowed do
+      with {:ok, project} <- discover_project(options),
+           {:ok, report} <-
+             models_api(options).discover(
+               project,
+               Keyword.put(options, :smoke, Keyword.get(parsed, :smoke, false))
+             ) do
+        if parsed[:json] do
+          IO.puts(Jason.encode!(report, pretty: true))
+        else
+          IO.puts(models_api(options).format(report))
+        end
+
+        0
+      else
+        {:error, reason} -> command_error(reason)
+      end
+    else
+      invalid_command_options(parsed)
     end
   end
 
@@ -583,6 +613,7 @@ defmodule Hancho.CLI do
 
   defp worktrees_api(options), do: Keyword.get(options, :worktrees_api, Hancho.Worktrees)
   defp demands_api(options), do: Keyword.get(options, :demands_api, Hancho.Demands)
+  defp models_api(options), do: Keyword.get(options, :models_api, Hancho.ModelDiscovery)
 
   defp demand_options(options) do
     Keyword.take(options, [
