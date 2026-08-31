@@ -570,6 +570,104 @@ One Hancho factory can own a repository at a time. The factory lease has a
 heartbeat. A new process can reclaim a stale lease after the recorded owner
 process ends.
 
+## Harness matrix runs
+
+Run one task through selected Harness provider and model combinations:
+
+```sh
+./hancho matrix-run \
+  --task-file test-task.md \
+  --cell codex=gpt-5.6-codex \
+  --cell claude=claude-sonnet-4-6 \
+  --concurrency 2
+```
+
+Use one `--cell PROVIDER=MODEL` option for each requested model. Omit `=MODEL`
+to use the provider default. Use `--task "..."` for a short task. Use only one
+of `--task` and `--task-file`. The pinned Amp adapter does not support an
+explicit model. The pinned Gemini adapter does not support a reasoning-effort
+option.
+
+Hancho requires a clean repository and takes the factory lease. It records the
+current commit. It creates one detached Git worktree for each cell at
+`.hancho/matrix-runs/MATRIX_RUN_ID/worktrees/CELL_ID/`. Each provider gets a
+different worktree, Mix dependency path, build path, and Harness run. Cells in
+one concurrent batch start from the same commit. Hancho does not merge a cell
+result into the source branch.
+
+The command supports these limits:
+
+- `--concurrency N` sets the number of cells in one concurrent batch. The
+  default is `1`.
+- `--timeout-ms N` sets the time limit for each cell. The default is 30
+  minutes.
+- `--max-time-ms N` sets the total matrix time limit. The default is 60
+  minutes.
+- `--max-tasks N` sets the maximum number of Harness calls for the one source
+  task. The default is `20`.
+- `--max-tokens N` stops new batches after additive, run-scoped token use
+  reaches the limit.
+- `--max-cost-usd N` stops new batches after additive, run-scoped reported cost
+  reaches the limit.
+
+Cost and token checks use only provider-reported values. Hancho does not
+estimate missing values. It does not add provider-cumulative or unknown-scope
+values. One active batch or one provider run can pass a cost or token limit
+before Hancho gets its terminal measurement. The report states this possible
+overrun and shows which values were not available.
+
+Each cell report includes the provider, requested model, effective model when a
+normalized start event contains it, Harness run ID, provider session ID,
+bounded output, tool calls and results, Git file status, a tracked-file patch,
+test command evidence, timing, usage, cost, and failure data. Untracked paths
+are listed with content hashes, but the patch has tracked changes only. A Git
+status or diff error makes the comparison evidence incomplete. Harness journals,
+patches, `report.json`, and `comparison.md` stay under the matrix run directory.
+The worktrees stay registered and available for inspection. Matrix reports can
+contain the task, model output, tool input, command output, and source changes.
+Hancho redacts sensitive keys, Bearer values, and secret values from the process
+environment before it writes report and patch artifacts. This filter is a
+defense in depth measure. Keep `.hancho/` private.
+
+The comparison groups different outputs and file changes. It also shows
+requested model, provider-reported effective model, whether those two values
+match, test, timing, usage, cost, and status differences. A configured model is
+only a request. Hancho does not call it the effective model unless a normalized
+provider start event reports that value. It marks missing effective model,
+usage, output, or cell data as incomplete. It does not rank cells and does not
+select a winner from incomplete evidence.
+
+Add `--json` to write the complete report to standard output as JSON. Hancho
+still saves the JSON and Markdown files:
+
+```sh
+./hancho matrix-run --task "Add a parser test." \
+  --cell codex=model-a --cell codex=model-b --json
+```
+
+For a local agentic-commerce fixture, add a loopback origin:
+
+```sh
+./hancho matrix-run --task-file cart-test.md \
+  --cell claude=claude-sonnet-4-6 \
+  --local-server http://127.0.0.1:4000
+```
+
+The value must be an HTTP or HTTPS origin on `localhost`, `127.0.0.1`, or
+`::1`. It cannot contain credentials, a path, a query, or a fragment. Hancho
+adds task rules that prohibit real purchases, real financial transactions, and
+production commerce services. Local-server mode accepts only the Claude and
+Z.AI adapters because their sandbox has an enforced host allowlist. Hancho
+rejects Codex and the other adapters in this mode because their pinned Harness
+adapters cannot limit network access to one loopback host.
+
+Local-server evidence comes from normalized Harness tool and command events
+that contain the exact origin. This proves only that the agent-side event
+referred to the local server. It is not a verified server request log. A later
+test fixture can compare this evidence with its own local request log. Hancho
+does not start a commerce server, make a purchase, or contact a production
+commerce service.
+
 ## Retry and resume
 
 Continue one stopped workflow from its stopped step:

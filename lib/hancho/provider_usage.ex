@@ -36,7 +36,8 @@ defmodule Hancho.ProviderUsage do
     values =
       usage
       |> Map.new(fn {key, value} -> {to_string(key), value} end)
-      |> Map.filter(fn {_key, value} -> is_number(value) end)
+      |> Map.filter(fn {_key, value} -> is_number(value) and value >= 0 end)
+      |> put_total_tokens()
 
     cond do
       values == %{} -> new!("unavailable", "unavailable", false, %{})
@@ -79,6 +80,20 @@ defmodule Hancho.ProviderUsage do
 
   defp new!(status, scope, additive, values),
     do: Zoi.parse!(@schema, %{status: status, scope: scope, additive: additive, values: values})
+
+  defp put_total_tokens(%{"total_tokens" => total} = values) when is_number(total),
+    do: values
+
+  defp put_total_tokens(values) do
+    input = Map.get(values, "input_tokens")
+    output = Map.get(values, "output_tokens")
+
+    if is_number(input) or is_number(output) do
+      Map.put(values, "total_tokens", (input || 0) + (output || 0))
+    else
+      values
+    end
+  end
 
   defp summary_status([], _additive, _excluded), do: "unavailable"
   defp summary_status(_available, [], _excluded), do: "non_additive"

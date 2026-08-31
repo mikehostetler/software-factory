@@ -53,4 +53,25 @@ defmodule Hancho.ProviderUsageTest do
     assert usage["status"] == "unavailable"
     assert usage["scope"] == "unavailable"
   end
+
+  test "derives a nonnegative total and rejects negative measurements" do
+    usage =
+      ProviderUsage.normalize(:codex, %{
+        "input_tokens" => 10,
+        "output_tokens" => 2,
+        "cost_usd" => -1
+      })
+      |> ProviderUsage.to_map()
+
+    assert usage["values"] == %{
+             "input_tokens" => 10,
+             "output_tokens" => 2,
+             "total_tokens" => 12
+           }
+
+    unavailable =
+      ProviderUsage.normalize(:codex, %{"total_tokens" => -5}) |> ProviderUsage.to_map()
+
+    assert unavailable["status"] == "unavailable"
+  end
 end

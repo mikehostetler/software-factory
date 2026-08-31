@@ -39,6 +39,8 @@ defmodule Hancho.CLI do
                       Preview or apply missing demand mappings
     hancho queue WORKFLOW --source beadwork-ready --count N [--dry-run] [--verbose]
                       Run ready Beadwork tasks serially in the foreground
+    hancho matrix-run --task-file PATH --cell PROVIDER[=MODEL] [--cell ...]
+                      Run one task across isolated Harness provider and model cells
     hancho --version  Print the Hancho version
     hancho --help     Print this help
   """
@@ -54,7 +56,19 @@ defmodule Hancho.CLI do
     response: :string,
     port: :integer,
     json: :boolean,
-    smoke: :boolean
+    smoke: :boolean,
+    task: :string,
+    task_file: :string,
+    cell: :keep,
+    json: :boolean,
+    concurrency: :integer,
+    timeout_ms: :integer,
+    max_time_ms: :integer,
+    max_tasks: :integer,
+    max_tokens: :integer,
+    max_cost_usd: :float,
+    local_server: :string,
+    reasoning_effort: :string
   ]
   @aliases [h: :help, v: :version]
 
@@ -371,6 +385,47 @@ defmodule Hancho.CLI do
     end
   end
 
+  defp dispatch_command(["matrix-run"], parsed, options) do
+    allowed = [
+      :task,
+      :task_file,
+      :cell,
+      :json,
+      :concurrency,
+      :timeout_ms,
+      :max_time_ms,
+      :max_tasks,
+      :max_tokens,
+      :max_cost_usd,
+      :local_server,
+      :reasoning_effort
+    ]
+
+    if Enum.all?(Keyword.keys(parsed), &(&1 in allowed)) do
+      with {:ok, prompt} <- matrix_prompt(parsed, options),
+           {:ok, project} <- discover_project(options),
+           {:ok, report} <-
+             matrix_api(options).run(
+               project,
+               prompt,
+               Keyword.get_values(parsed, :cell),
+               matrix_options(parsed, options)
+             ) do
+        print_matrix_report(report, parsed[:json] || false)
+      else
+        {:error, {:validation, message}} ->
+          IO.puts(:stderr, "ERROR: #{message}")
+          2
+
+        {:error, reason} ->
+          IO.puts(:stderr, "ERROR: #{format_error(reason)}")
+          1
+      end
+    else
+      invalid_command_options(parsed)
+    end
+  end
+
   defp dispatch_command(_arguments, parsed, _options) when parsed != [] do
     options = parsed |> Keyword.keys() |> Enum.map_join(" ", &"--#{&1}")
     IO.puts(:stderr, "ERROR: Options are not valid for this command: #{options}")
@@ -614,6 +669,63 @@ defmodule Hancho.CLI do
   defp worktrees_api(options), do: Keyword.get(options, :worktrees_api, Hancho.Worktrees)
   defp demands_api(options), do: Keyword.get(options, :demands_api, Hancho.Demands)
   defp models_api(options), do: Keyword.get(options, :models_api, Hancho.ModelDiscovery)
+  defp matrix_api(options), do: Keyword.get(options, :matrix_api, Hancho.MatrixRun)
+
+  defp matrix_prompt(parsed, options) do
+    case {parsed[:task], parsed[:task_file]} do
+      {task, nil} when is_binary(task) ->
+        {:ok, task}
+
+      {nil, path} when is_binary(path) ->
+        cwd = Keyword.get(options, :cwd, File.cwd!())
+
+        case File.read(Path.expand(path, cwd)) do
+          {:ok, task} -> {:ok, task}
+          {:error, reason} -> {:error, {:validation, "Cannot read the task file: #{reason}."}}
+        end
+
+      {nil, nil} ->
+        {:error, {:validation, "Matrix run requires --task or --task-file."}}
+
+      {_task, _path} ->
+        {:error, {:validation, "Use only one of --task or --task-file."}}
+    end
+  end
+
+  defp matrix_options(parsed, options) do
+    parsed_options =
+      [
+        :concurrency,
+        :timeout_ms,
+        :max_time_ms,
+        :max_tasks,
+        :max_tokens,
+        :max_cost_usd,
+        :local_server,
+        :reasoning_effort
+      ]
+      |> Enum.reduce([], fn key, values ->
+        case Keyword.fetch(parsed, key) do
+          {:ok, value} -> Keyword.put(values, key, value)
+          :error -> values
+        end
+      end)
+
+    Keyword.merge(options, parsed_options)
+  end
+
+  defp print_matrix_report(report, true) do
+    IO.puts(Jason.encode!(report, pretty: true))
+    matrix_exit_status(report)
+  end
+
+  defp print_matrix_report(report, false) do
+    IO.puts(Hancho.MatrixRun.Report.human(report))
+    matrix_exit_status(report)
+  end
+
+  defp matrix_exit_status(%{"status" => "completed"}), do: 0
+  defp matrix_exit_status(_report), do: 1
 
   defp demand_options(options) do
     Keyword.take(options, [

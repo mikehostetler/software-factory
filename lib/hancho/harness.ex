@@ -86,7 +86,9 @@ defmodule Hancho.Harness do
 
       case result do
         {:ok, _result} -> result
-        {:error, :timeout} -> cancel_after_timeout(run_id, cancellation_timeout)
+        {:error, :timeout} ->
+          cancel_after_timeout(run_id, cancellation_timeout, event_callback, resume_cursor, nil)
+
         {:error, _reason} = error -> cancel_after_error(run_id, cancellation_timeout, error)
       end
     end
@@ -297,9 +299,11 @@ defmodule Hancho.Harness do
     end
   end
 
-  defp cancel_after_timeout(run_id, timeout) do
+  defp cancel_after_timeout(run_id, timeout, event_callback, cursor, latest) do
     cancel_result = Jido.Harness.Run.cancel(run_id)
     terminal = Jido.Harness.Run.await(run_id, timeout)
+    {_next_cursor, _latest, events} = replay(run_id, cursor, latest)
+    _result = notify_events(event_callback, events)
     {:error, {:harness_await_timeout, run_id, cancel_result, terminal}}
   end
 
@@ -324,24 +328,48 @@ defmodule Hancho.Harness do
   defp configure_journal(provider, journal_dir) do
     with :ok <- File.mkdir_p(journal_dir),
          :ok <- File.chmod(journal_dir, 0o700) do
-      provider_config = Application.get_env(:jido_harness, :provider_config, %{}) |> Map.new()
-      config = provider_config |> Map.get(provider, %{}) |> Map.new()
-      retention = config |> Map.get(:retention, %{}) |> Map.new()
-      config = Map.put(config, :retention, Map.put(retention, :journal_dir, journal_dir))
+      :global.trans({__MODULE__, :journal_configuration}, fn ->
+        provider_config = Application.get_env(:jido_harness, :provider_config, %{}) |> Map.new()
+        config = provider_config |> Map.get(provider, %{}) |> Map.new()
+        retention = config |> Map.get(:retention, %{}) |> Map.new()
+        config = Map.put(config, :retention, Map.put(retention, :journal_dir, journal_dir))
 
-      Application.put_env(
-        :jido_harness,
-        :provider_config,
-        Map.put(provider_config, provider, config)
-      )
+        Application.put_env(
+          :jido_harness,
+          :provider_config,
+          Map.put(provider_config, provider, config)
+        )
+      end)
     end
   end
 
   defp replay(run_id, cursor, latest) do
-    case Jido.Harness.Run.replay(run_id, cursor: cursor, limit: 10_000) do
-      {:ok, []} -> {cursor, latest, []}
-      {:ok, events} -> {List.last(events).sequence, List.last(events), events}
-      {:error, _reason} -> {cursor, latest, []}
+    replay_next(run_id, cursor, latest, @stream_replay_limit, [])
+  end
+
+  defp replay_next(_run_id, cursor, latest, 0, pages) do
+    {cursor, latest, pages |> Enum.reverse() |> List.flatten()}
+  end
+
+  defp replay_next(run_id, cursor, latest, remaining, pages) do
+    limit = min(remaining, @stream_replay_page_size)
+
+    case Jido.Harness.Run.replay(run_id, cursor: cursor, limit: limit) do
+      {:ok, []} ->
+        {cursor, latest, pages |> Enum.reverse() |> List.flatten()}
+
+      {:ok, events} ->
+        next_cursor = List.last(events).sequence
+        next_latest = List.last(events)
+
+        if next_cursor > cursor do
+          replay_next(run_id, next_cursor, next_latest, remaining - length(events), [events | pages])
+        else
+          {cursor, latest, pages |> Enum.reverse() |> List.flatten()}
+        end
+
+      {:error, _reason} ->
+        {cursor, latest, pages |> Enum.reverse() |> List.flatten()}
     end
   end
 

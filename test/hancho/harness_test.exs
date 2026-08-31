@@ -74,6 +74,26 @@ defmodule Hancho.HarnessTest do
     end
   end
 
+  defmodule BurstAdapter do
+    @behaviour Jido.Harness.Adapter
+
+    alias Jido.Harness.Event
+
+    @impl true
+    def spec, do: SlowAdapter.spec()
+
+    @impl true
+    def status(config), do: SlowAdapter.status(config)
+
+    @impl true
+    def run(_request, _context) do
+      {:ok,
+       Enum.map(1..10_005, fn number ->
+         Event.new!(provider: :codex, type: :thinking_delta, payload: %{"text" => "#{number}"})
+       end)}
+    end
+  end
+
   defmodule FailureAdapter do
     @behaviour Jido.Harness.Adapter
 
@@ -277,7 +297,11 @@ defmodule Hancho.HarnessTest do
                  await_timeout: 300,
                  progress_interval_ms: 5,
                  andon_warning_ms: 50,
-                 cancellation_timeout_ms: 1_000
+                 cancellation_timeout_ms: 1_000,
+                 event_callback: fn events ->
+                   send(test_pid, {:timeout_events, events})
+                   :ok
+                 end
                ],
                fn progress ->
                  send(test_pid, {:progress, progress})
@@ -297,6 +321,7 @@ defmodule Hancho.HarnessTest do
     assert inactivity_ms >= 50
     refute_received {:progress, %{phase: :andon}}
     assert_received {:slow_adapter_cancelled, ^run_id}
+    assert Enum.any?(receive_timeout_events([]), &(&1.type == :run_cancelled))
     assert {:ok, %{state: :cancelled}} = Jido.Harness.Run.info(run_id)
     assert :ok = Jido.Harness.Run.prune(run_id)
   end
@@ -484,6 +509,40 @@ defmodule Hancho.HarnessTest do
     assert :ok = Jido.Harness.Run.prune(run_id)
   end
 
+  test "drains event replay batches larger than one Harness page" do
+    install_adapter(BurstAdapter)
+    {:ok, collector} = Agent.start_link(fn -> [] end)
+
+    on_exit(fn ->
+      if Process.alive?(collector), do: Agent.stop(collector)
+    end)
+
+    assert {:ok, result} =
+             Hancho.Harness.run_with_progress(
+               :codex,
+               "Emit more than one replay page.",
+               [
+                 cwd: temporary_directory(),
+                 await_timeout: 5_000,
+                 runtime_timeout_ms: 5_000,
+                 idle_timeout_ms: 5_000,
+                 progress_interval_ms: 1_000,
+                 event_poll_interval_ms: 1_000,
+                 event_callback: fn events ->
+                   Agent.update(collector, &(&1 ++ events))
+                   :ok
+                 end
+               ],
+               fn _progress -> :ok end
+             )
+
+    events = Agent.get(collector, & &1)
+    assert length(events) == 10_007
+    assert List.last(events).type == :run_completed
+    assert events |> Enum.map(& &1.sequence) |> Enum.uniq() |> length() == length(events)
+    assert :ok = Jido.Harness.Run.prune(result.run_id)
+  end
+
   defp temporary_directory do
     path = Path.join(System.tmp_dir!(), "hancho-harness-#{System.unique_integer([:positive])}")
     File.mkdir_p!(path)
@@ -532,6 +591,14 @@ defmodule Hancho.HarnessTest do
       {:events, events} -> received_events([events | batches])
     after
       0 -> batches |> Enum.reverse() |> List.flatten()
+    end
+  end
+
+  defp receive_timeout_events(events) do
+    receive do
+      {:timeout_events, batch} -> receive_timeout_events(events ++ batch)
+    after
+      100 -> events
     end
   end
 
